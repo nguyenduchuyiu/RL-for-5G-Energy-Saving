@@ -1,0 +1,39 @@
+{
+  "name": "Indoor Hotspot",
+  "description": "3GPP Indoor hotspot with small coverage and high user density",
+  "deploymentScenario": "indoor_hotspot",
+  
+  "carrierFrequency": 4e9,
+  "systemBandwidth": 200e6,
+  "layout": "single_layer_indoor",
+  "isd": 20,
+  
+  "numSites": 12,
+  "numSectors": 1,
+  "antennaHeight": 3,
+  "cellRadius": 15,
+  
+  "numUEs": 120,
+  "userDistribution": "100% Indoor",
+  "ueSpeed": 3,
+  "indoorRatio": 1.0,
+  
+  "minTxPower": 10,
+  "maxTxPower": 23,
+  "basePower": 50,
+  "idlePower": 15,
+  
+  "simTime": 300,
+  "timeStep": 1,
+  
+  "rsrpServingThreshold": -110,
+  "rsrpTargetThreshold": -100,
+  "rsrpMeasurementThreshold": -115,
+  "dropCallThreshold": 1,
+  "latencyThreshold": 50,
+  "cpuThreshold": 90,
+  "prbThreshold": 90,
+  
+  "trafficLambda": 20,
+  "peakHourMultiplier": 1.5
+}

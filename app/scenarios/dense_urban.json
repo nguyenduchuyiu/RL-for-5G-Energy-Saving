@@ -1,0 +1,40 @@
+{
+  "name": "3GPP Dense Urban",
+  "description": "3GPP Dense urban",
+  "deploymentScenario": "dense_urban",
+  
+  "carrierFrequency": 4e9,
+  "systemBandwidth": 200e6,
+  "layout": "two_layer",
+  "isd": 200,
+  
+  "numSites": 7,
+  "numSectors": 3,
+  "antennaHeight": 25,
+  "cellRadius": 200,
+  
+  "numUEs": 300,
+  "userDistribution": "Uniform/macro",
+  "ueSpeed": 3,
+  "indoorRatio": 0.8,
+  "outdoorSpeed": 30,
+  
+  "minTxPower": 30,
+  "maxTxPower": 46,
+  "basePower": 800,
+  "idlePower": 200,
+  
+  "simTime": 300,
+  "timeStep": 1,
+  
+  "rsrpServingThreshold": -110,
+  "rsrpTargetThreshold": -100,
+  "rsrpMeasurementThreshold": -115,
+  "dropCallThreshold": 1,
+  "latencyThreshold": 50,
+  "cpuThreshold": 95,
+  "prbThreshold": 95,
+  
+  "trafficLambda": 15,
+  "peakHourMultiplier": 1.3
+}

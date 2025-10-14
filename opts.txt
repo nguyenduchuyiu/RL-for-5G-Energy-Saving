@@ -1,0 +1,6 @@
+# Format: scenario_name E_opt (kWh)
+# Eopts được tính bằng cách điều chỉnh công suất phát tất cả các cell xuống tối thiểu
+indoor_hotspot 0.181
+dense_urban 1.708
+rural 5.799
+urban_macro 1.929
