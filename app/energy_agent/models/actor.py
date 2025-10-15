@@ -1,52 +1,89 @@
-# energy_agent/actor.py
-
 import torch
 import torch.nn as nn
-from torch.distributions import Normal
+import torch.nn.functional as F
+import numpy as np
 
-LOG_STD_MAX = 2
-LOG_STD_MIN = -20
 
 class Actor(nn.Module):
     """
-    Mạng Actor (Policy) cho DrQ-v2/SAC.
-    Ánh xạ state tới một phân phối xác suất của action.
+    Actor network for PPO agent
+    Outputs continuous actions (power ratios) for each cell
+    Uses Gaussian policy with learned standard deviation
     """
-    def __init__(self, state_dim, action_dim, hidden_dim=256):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(state_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(),
-        )
-        self.mean_linear = nn.Linear(hidden_dim, action_dim)
-        self.log_std_linear = nn.Linear(hidden_dim, action_dim)
-
-    def forward(self, state):
-        x = self.net(state)
-        mean = self.mean_linear(x)
-        log_std = self.log_std_linear(x)
-        log_std = torch.clamp(log_std, LOG_STD_MIN, LOG_STD_MAX)
-        return mean, log_std
-
-    def sample(self, state, deterministic=False):
-        mean, log_std = self.forward(state)
-        std = log_std.exp()
-        normal = Normal(mean, std)
-
-        if deterministic:
-            # Ở chế độ đánh giá, lấy hành động có xác suất cao nhất
-            z = mean
+    
+    def __init__(self, state_dim, action_dim, hidden_dim=256, activation='relu'):
+        """
+        Initialize Actor network
+        
+        Args:
+            state_dim (int): Dimension of input state
+            action_dim (int): Dimension of output action
+            hidden_dim (int): Hidden layer dimension
+            activation (str): Activation function type
+        """
+        super(Actor, self).__init__()
+        
+        self.state_dim = state_dim
+        self.action_dim = action_dim
+        self.hidden_dim = hidden_dim
+        
+        # Choose activation function
+        if activation == 'relu':
+            self.activation_fn = F.relu
+        elif activation == 'tanh':
+            self.activation_fn = torch.tanh
+        elif activation == 'elu':
+            self.activation_fn = F.elu
         else:
-            # Ở chế độ huấn luyện, lấy mẫu (reparameterization trick)
-            z = normal.rsample()
+            self.activation_fn = F.relu
         
-        # Áp dụng tanh để đưa action về khoảng [-1, 1]
-        action = torch.tanh(z)
+        # Network layers
+        self.fc1 = nn.Linear(state_dim, hidden_dim)
+        self.fc2 = nn.Linear(hidden_dim, hidden_dim)
+        self.fc3 = nn.Linear(hidden_dim, hidden_dim // 2)
         
-        # Tính log_prob theo công thức của SAC
-        log_prob = normal.log_prob(z) - torch.log(1 - action.pow(2) + 1e-6)
-        log_prob = log_prob.sum(1, keepdim=True)
+        # Action mean head
+        self.action_mean = nn.Linear(hidden_dim // 2, action_dim)
         
-        return action, log_prob
+        # Action standard deviation head (learnable)
+        self.action_logstd = nn.Linear(hidden_dim // 2, action_dim)
+        
+        # Initialize weights
+        self.init_weights()
+    
+    def init_weights(self):
+        """Initialize network weights using orthogonal initialization"""
+        for layer in [self.fc1, self.fc2, self.fc3]:
+            nn.init.orthogonal_(layer.weight, gain=np.sqrt(2))
+            nn.init.zeros_(layer.bias)
+        
+        # Initialize action mean with smaller weights for stability
+        nn.init.orthogonal_(self.action_mean.weight, gain=0.01)
+        nn.init.zeros_(self.action_mean.bias)
+        
+        # Initialize log std to produce reasonable initial exploration
+        nn.init.constant_(self.action_logstd.weight, 0.0)
+        nn.init.constant_(self.action_logstd.bias, -0.5)  # Initial std ≈ 0.6
+    
+    def forward(self, state):
+        """
+        Forward pass through actor network
+        
+        Args:
+            state (torch.Tensor): Input state tensor
+            
+        Returns:
+            tuple: (action_mean, action_logstd)
+        """
+        # Forward through shared layers
+        x = self.activation_fn(self.fc1(state))
+        x = self.activation_fn(self.fc2(x))
+        x = self.activation_fn(self.fc3(x))
+        
+        # Compute action mean (bounded to [0, 1] using sigmoid)
+        action_mean = torch.sigmoid(self.action_mean(x))
+        
+        # Compute action log standard deviation (bounded for stability)
+        action_logstd = torch.clamp(self.action_logstd(x), min=-20, max=2)
+        
+        return action_mean, action_logstd

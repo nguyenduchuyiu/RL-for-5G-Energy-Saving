@@ -1,5 +1,5 @@
 {
-  "name": "3GPP Rural",
+  "name": "3GPP Rural Macro",
   "description": "3GPP Rural deployment scenario with wide area coverage for high speed vehicles",
   "deploymentScenario": "rural",
   
@@ -19,8 +19,8 @@
   "indoorRatio": 0.5,
   "outdoorSpeed": 120,
   
-  "minTxPower": 35,
-  "maxTxPower": 49,
+  "minTxPower": 20,
+  "maxTxPower": 46,
   "basePower": 1200,
   "idlePower": 300,
   

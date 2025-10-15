@@ -1,5 +1,5 @@
 {
-  "name": "3GPP Indoor Hotspot",
+  "name": "Indoor Hotspot",
   "description": "3GPP Indoor hotspot with small coverage and high user density",
   "deploymentScenario": "indoor_hotspot",
   
@@ -23,7 +23,7 @@
   "basePower": 50,
   "idlePower": 15,
   
-  "simTime": 300,
+  "simTime": 0,
   "timeStep": 1,
   
   "rsrpServingThreshold": -110,
