@@ -16,14 +16,14 @@
   "numUEs": 120,
   "userDistribution": "100% Indoor",
   "ueSpeed": 3,
-  "indoorRatio": 1.0,
+  "indoorRatio": 1.0, 
   
   "minTxPower": 10,
   "maxTxPower": 23,
   "basePower": 50,
   "idlePower": 15,
   
-  "simTime": 0,
+  "simTime": 200,
   "timeStep": 1,
   
   "rsrpServingThreshold": -110,
