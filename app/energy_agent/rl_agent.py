@@ -83,7 +83,8 @@ class RLAgent:
         self.buffer = TransitionBuffer(self.buffer_size)
 
         # bookkeeping
-        self.training_mode = True
+        self.training_mode = os.environ.get("ES_TRAINING_MODE", "1") != "0"
+        print(f"Training mode: {self.training_mode}")
         self.total_episodes = 0
         self.total_steps = 0
         self.episode_rewards = deque(maxlen=100)
@@ -111,6 +112,16 @@ class RLAgent:
 
         # timing debug
         self._time_check = True
+        
+        # checkpointing (auto load/save across scenarios)
+        self.checkpoint_path = os.environ.get("ES_CHECKPOINT_PATH", os.path.join("logs", "ppo_fast_model.pth"))
+        self.auto_checkpoint = os.environ.get("ES_AUTO_CHECKPOINT", "1") != "0"
+        try:
+            ckpt_dir = os.path.dirname(self.checkpoint_path)
+            if ckpt_dir:
+                os.makedirs(ckpt_dir, exist_ok=True)
+        except Exception:
+            pass
         
     def setup_logging(self, log_file):
         self.logger = logging.getLogger('PatchedPPOAgent')
@@ -184,6 +195,14 @@ class RLAgent:
         self.drop_ma_window.clear()
         self.latency_ma_window.clear()
         self.logger.info(f"Starting episode {self.total_episodes}")
+        
+        # auto-load weights to continue training across scenarios
+        if self.auto_checkpoint and isinstance(self.checkpoint_path, str) and os.path.isfile(self.checkpoint_path):
+            try:
+                self.load_model(self.checkpoint_path)
+                self.logger.info(f"Loaded checkpoint from {self.checkpoint_path}")
+            except Exception as e:
+                self.logger.warning(f"Failed to load checkpoint {self.checkpoint_path}: {e}")
 
     def end_scenario(self):
         self.episode_rewards.append(self.current_episode_reward)
@@ -192,6 +211,13 @@ class RLAgent:
         # run final training if any
         if self.training_mode and len(self.buffer) >= self.batch_size:
             self.train()
+        
+        # auto-save weights for cross-scenario training continuity
+        if self.auto_checkpoint and isinstance(self.checkpoint_path, str):
+            try:
+                self.save_model(self.checkpoint_path)
+            except Exception as e:
+                self.logger.warning(f"Failed to save checkpoint {self.checkpoint_path}: {e}")
 
     def get_action(self, state):
         """
@@ -204,55 +230,30 @@ class RLAgent:
         t0 = time.perf_counter() if self._time_check else None
 
         base_state = np.array(state).flatten()
-        # heuristic warm-start for early steps
-        if self.total_steps < self.warm_start_steps:
-            # compute avg load from cell features (loadRatio at last feature of each cell)
-            try:
-                start_idx = 17 + 14
-                load_indices = [start_idx + i*12 + 11 for i in range(self.n_cells)]  # loadRatio index in cell block
-                loads = [base_state[i] for i in load_indices if i < len(base_state)]
-                avg_load = np.mean(loads) if len(loads) > 0 else 0.5
-            except Exception:
-                avg_load = 0.5
-            base = 0.45 if avg_load < 0.2 else 0.7
-            heuristic = np.clip(base + np.random.normal(0, self.noise_scale, size=self.n_cells), 0.0, 1.0)
-            action = heuristic
-        else:
-            # build augmented state, map to base dim via adapter, feed actor
-            aug_state = self._build_augmented_state(base_state)
-            with torch.no_grad():
-                aug_tensor = torch.FloatTensor(aug_state).unsqueeze(0).to(self.device)
-                adapted = self.adapter(aug_tensor)  # -> [1, state_dim_base]
-                action_mean, action_logstd = self.actor(adapted)
-                if self.training_mode:
-                    action_std = torch.exp(action_logstd)
-                    dist = torch.distributions.Normal(action_mean, action_std)
-                    sampled = dist.rsample()
-                    log_prob = dist.log_prob(sampled).sum(-1)
-                else:
-                    sampled = action_mean
-                    log_prob = torch.zeros(1).to(self.device)
-                action = sampled.squeeze(0).cpu().numpy()
-                # action produced by actor is already in [0,1] due to sigmoid in Actor
-                # add small gaussian exploration noise
-                if self.training_mode:
-                    action = action + np.random.normal(0, self.noise_scale, size=action.shape)
-                    action = np.clip(action, 0.0, 1.0)
-
-                # store last log prob for buffer use
-                self.last_log_prob = log_prob.cpu().numpy() if 'log_prob' in locals() else np.array([0.0])
-
-        # smoothing + hysteresis
-        smoothed = self.smoothing_alpha * self.prev_action + (1.0 - self.smoothing_alpha) * action
-        delta = smoothed - self.prev_action
-        small_change_mask = np.abs(delta) < self.hysteresis_threshold
-        smoothed[small_change_mask] = self.prev_action[small_change_mask]
-        smoothed = np.clip(smoothed, 0.0, 1.0)
+        # actor-only action (no warm-start heuristic, no smoothing/hysteresis)
+        aug_state = self._build_augmented_state(base_state)
+        with torch.no_grad():
+            aug_tensor = torch.FloatTensor(aug_state).unsqueeze(0).to(self.device)
+            adapted = self.adapter(aug_tensor)  # -> [1, state_dim_base]
+            action_mean, action_logstd = self.actor(adapted)
+            if self.training_mode:
+                action_std = torch.exp(action_logstd)
+                dist = torch.distributions.Normal(action_mean, action_std)
+                sampled = dist.rsample()
+                log_prob = dist.log_prob(sampled).sum(-1)
+            else:
+                sampled = action_mean
+                log_prob = torch.zeros(1).to(self.device)
+            action = sampled.squeeze(0).cpu().numpy()
+            if self.training_mode:
+                action = action + np.random.normal(0, self.noise_scale, size=action.shape)
+            action = np.clip(action, 0.0, 1.0)
+            self.last_log_prob = log_prob.cpu().numpy() if 'log_prob' in locals() else np.array([0.0])
 
         # update prev_action for next step & store
-        self.prev_action = smoothed.copy()
+        self.prev_action = action.copy()
         self.last_state = base_state
-        self.last_action = smoothed.copy()
+        self.last_action = action.copy()
 
         if self._time_check:
             t1 = time.perf_counter()
@@ -260,7 +261,7 @@ class RLAgent:
             if elapsed > 50.0:
                 self.logger.warning(f"get_action took {elapsed:.1f} ms (exceeds 50ms)")
 
-        return smoothed.copy()
+        return action.copy()
 
     def calculate_reward(self, prev_state, action, current_state):
         """Modified reward: energy saving scaled, heavy penalties on drop/latency violations"""
@@ -513,6 +514,13 @@ class RLAgent:
         if filepath is None:
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             filepath = f"ppo_fast_model_{timestamp}.pth"
+        # ensure directory exists
+        try:
+            dirpath = os.path.dirname(filepath)
+            if dirpath:
+                os.makedirs(dirpath, exist_ok=True)
+        except Exception:
+            pass
         checkpoint = {
             'actor_state_dict': self.actor.state_dict(),
             'critic_state_dict': self.critic.state_dict(),

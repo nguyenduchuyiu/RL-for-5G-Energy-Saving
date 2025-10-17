@@ -23,7 +23,7 @@
   "basePower": 50,
   "idlePower": 15,
   
-  "simTime": 200,
+  "simTime": 100,
   "timeStep": 1,
   
   "rsrpServingThreshold": -110,
