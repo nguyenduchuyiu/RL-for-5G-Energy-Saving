@@ -4,7 +4,14 @@ from collections import deque, namedtuple
 
 # Define transition structure
 Transition = namedtuple('Transition', [
-    'state', 'action', 'reward', 'next_state', 'done', 'log_prob', 'value'
+    'state',            # normalized, padded state (len = state_dim_base)
+    'action',           # full padded action (len = n_cells_max)
+    'reward',
+    'next_state',       # normalized, padded next state
+    'done',
+    'log_prob',         # masked sum log-prob over valid action dims
+    'value',
+    'action_mask'       # 1 for valid cells, 0 for padded (len = n_cells_max)
 ])
 
 
