@@ -16,6 +16,7 @@ services:
       - ../energy_agent:/app/energy_agent_parent
       - ../scenarios:/app/scenarios_parent
       - ../logs:/app/logs
+      - ../plots:/app/plots
       - ../visualization:/app/visualization
       - /tmp/.X11-unix:/tmp/.X11-unix:rw
     network_mode: host

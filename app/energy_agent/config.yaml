@@ -1,0 +1,25 @@
+training_mode: True
+use_gpu: True
+checkpoint_path: "app/energy_agent/models/ppo_model_1k.pth"
+
+actor_lr: 0.0001
+critic_lr: 0.0003
+
+energy_coeff: 0.1
+drop_magnitude_penalty_coef: 10.0
+latency_magnitude_penalty_coef: 5.0
+cpu_magnitude_penalty_coef: 10.0
+prb_magnitude_penalty_coef: 10.0
+improvement_coeff: 5.0
+
+violation_event_penalty: -10.0
+energy_consumption_penalty: -10.0
+
+gamma: 0.99
+lambda_gae: 0.95
+clip_epsilon: 0.2
+ppo_epochs: 4
+batch_size: 64
+buffer_size: 200
+step_per_episode: 10 # same as buffer_size
+hidden_dim: 256

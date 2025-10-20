@@ -18,21 +18,26 @@ RUN apt-get update && apt-get install -y \
     && rm -rf /var/lib/apt/lists/*
 
 RUN apt-get update && apt-get install -y \
-wget \
-unzip \
-xorg \
-default-jre \
-libncurses6 \
-libxext6 \
-libx11-6 \
-libglu1-mesa \
-libxtst6 \
-libxmu6 \
-libxi6
+    wget \
+    unzip \
+    xorg \
+    default-jre \
+    libncurses6 \
+    libxext6 \
+    libx11-6 \
+    libglu1-mesa \
+    libxtst6 \
+    libxmu6 \
+    libxi6
 
 # --- Install Python Dependencies ---
 COPY requirements.txt /tmp/requirements.txt
 RUN pip3 install --no-cache-dir -r /tmp/requirements.txt
+
+# --- Setup MATLAB Runtime Environment Variables ---
+ENV MCR_ROOT=/opt/mcr/R2025a
+ENV LD_LIBRARY_PATH=${MCR_ROOT}/runtime/glnxa64:${MCR_ROOT}/bin/glnxa64:${MCR_ROOT}/sys/os/glnxa64:${LD_LIBRARY_PATH}
+ENV XAPPLRESDIR=${MCR_ROOT}/X11/app-defaults
 
 # --- Install MATLAB Runtime ---
 WORKDIR /opt/mcr
