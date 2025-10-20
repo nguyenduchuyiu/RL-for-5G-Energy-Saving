@@ -1,4 +1,4 @@
-    {
+{
   "name": "3GPP Urban Macro",
   "description": "3GPP Urban macro deployment scenario with large cells and continuous coverage",
   "deploymentScenario": "urban_macro",
