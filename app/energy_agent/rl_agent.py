@@ -34,7 +34,7 @@ class RLAgent:
         self.n_cells = int(n_cells)
         self.max_cells = int(max_cells)
         self.max_time = int(max_time)
-        self.use_gpu = config['use_gpu']
+        self.use_gpu = config['use_gpu'] and torch.cuda.is_available()
         self.device = torch.device('cuda' if self.use_gpu else 'cpu')
         
         self.original_state_dim = 17 + 14 + (self.max_cells * 12)
@@ -101,6 +101,9 @@ class RLAgent:
                                  'latency_improvement': 0.0, 'energy_consumption_penalty': 0.0, 'energy_efficiency_reward': 0.0}
                 
         self.setup_logging(log_file)
+        
+        if config['use_gpu'] and not torch.cuda.is_available():
+            self.logger.warning("GPU requested but CUDA not available, using CPU instead")
         
         self.logger.info(f"PPO Agent initialized: {n_cells} cells, {n_ues} UEs")
         self.logger.info(f"State dim: {self.state_dim}, Action dim: {self.action_dim}")
