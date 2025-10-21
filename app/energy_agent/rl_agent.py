@@ -112,6 +112,9 @@ class RLAgent:
         if os.path.exists(self.checkpoint_path):
             self.load_model(self.checkpoint_path)
             self.logger.info(f"Loaded checkpoint from {self.checkpoint_path}")
+            self.logger.info(f"Fine-tuning with learning rate 3e-5 for actor and 1e-4 for critic")
+            self.actor_optimizer.param_groups[0]['lr'] = 3e-5
+            self.critic_optimizer.param_groups[0]['lr'] = 1e-4
         else:
             self.logger.info(f"No checkpoint found at {self.checkpoint_path}")
         
@@ -351,7 +354,6 @@ class RLAgent:
     
     def start_episode(self):
         print(f"Starting episode: {self.current_episode}")
-        self.episodic_metrics['energy_consumption'] = 0.0
         self.episodic_metrics['total_reward'] = 0.0
         self.episodic_metrics['drop_penalty'] = 0.0
         self.episodic_metrics['latency_penalty'] = 0.0
@@ -361,6 +363,7 @@ class RLAgent:
         self.episodic_metrics['latency_improvement'] = 0.0
         self.episodic_metrics['energy_efficiency_reward'] = 0.0
         self.episodic_metrics['total_energy_consumption'] = 0.0
+        self.episodic_metrics['energy_consumption_penalty'] = 0.0
     
     def end_episode(self):
         self.logger.info(f"Episode ={self.current_episode},\n"
@@ -369,9 +372,9 @@ class RLAgent:
                          f"Latency Penalty={self.episodic_metrics['latency_penalty']:.2f},\n"
                          f"CPU Penalty={self.episodic_metrics['cpu_penalty']:.2f},\n"
                          f"PRB Penalty={self.episodic_metrics['prb_penalty']:.2f},\n"
-                         f"Energy Efficiency Reward={self.episodic_metrics['energy_efficiency_reward']:.2f},\n"
                          f"Drop Improvement={self.episodic_metrics['drop_improvement']:.2f},\n"
                          f"Latency Improvement={self.episodic_metrics['latency_improvement']:.2f},\n"
+                         f"Energy Efficiency Reward={self.episodic_metrics['energy_efficiency_reward']:.2f},\n"
                          f"Total Energy Consumption={self.episodic_metrics['total_energy_consumption']:.2f},\n"
                          f"Energy Consumption Penalty={self.episodic_metrics['energy_consumption_penalty']:.2f},\n"
         )        
