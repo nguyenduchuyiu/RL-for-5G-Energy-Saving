@@ -364,6 +364,13 @@ class RLAgent:
         self.episodic_metrics['energy_efficiency_reward'] = 0.0
         self.episodic_metrics['total_energy_consumption'] = 0.0
         self.episodic_metrics['energy_consumption_penalty'] = 0.0
+        
+        self.actor_hidden_state = None
+        self.critic_hidden_state = None
+        
+        self.last_padded_action = np.ones(self.max_cells) * 0.7
+        self.current_padded_action = self.last_padded_action.copy()
+
     
     def end_episode(self):
         self.logger.info(f"Episode ={self.current_episode},\n"
