@@ -488,8 +488,8 @@ class RLAgent:
         prb_threshold = current_state[14]
         
         # --- Energy Reward ---
-        energy_change = current_energy - prev_energy
-        energy_efficiency_reward = self.energy_coeff * energy_change
+        energy_efficiency = prev_energy - current_energy 
+        energy_efficiency_reward = self.energy_coeff * energy_efficiency
         
         # Convert power (W) to energy (kWh)
         time_step = current_state[3]  # seconds
