@@ -2,3 +2,5 @@ numpy
 torch
 matplotlib
 pyyaml
+gymnasium
+stable-baselines3

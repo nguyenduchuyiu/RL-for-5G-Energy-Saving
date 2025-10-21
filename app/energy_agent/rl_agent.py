@@ -221,7 +221,7 @@ class RLAgent:
         dist_to_latency_thresh = latency_threshold - current_latency
         dist_to_cpu_thresh = cpu_threshold - max_cpu_usage
         dist_to_prb_thresh = prb_threshold - max_prb_usage
-        
+                
         # Network efficiency
         load_per_active_cell = total_traffic / (active_cells + 1e-6)
         # Load-Power efficiency: how much traffic is served per Watt of transmit power
