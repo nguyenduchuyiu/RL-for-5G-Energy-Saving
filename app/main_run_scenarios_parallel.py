@@ -7,6 +7,8 @@ Parallel version of main_run_scenarios_python.py
 import sys
 from pathlib import Path
 import numpy as np
+import os
+import glob
 
 # Add app directory to path
 sys.path.insert(0, str(Path(__file__).parent))
@@ -15,21 +17,45 @@ from simple_parallel_env import SimpleParallelEnv
 from energy_agent import RLAgent
 
 
-def main(n_parallel_envs: int = 4):
+def load_scenarios_from_directory(scenarios_dir: str = 'scenarios', base_seed: int = 42):
+    """
+    Load all scenario files from directory
+    
+    Args:
+        scenarios_dir: Directory containing scenario JSON files
+        base_seed: Base seed for scenarios
+    
+    Returns:
+        List of scenario configs with name and seed
+    """
+    # Get all JSON files in scenarios directory
+    scenario_files = sorted(glob.glob(os.path.join(scenarios_dir, '*.json')))
+    
+    suite = []
+    for scenario_file in scenario_files:
+        # Extract scenario name from filename (remove .json extension)
+        scenario_name = Path(scenario_file).stem
+        suite.append({'name': scenario_name, 'seed': base_seed})
+    
+    return suite
+
+
+def main(n_parallel_envs: int = 4, scenarios_dir: str = 'scenarios'):
     """Run all scenarios and generate energies.txt"""
     
-    # Define test suite (matching opts.txt format)
-    suite = [
-        {'name': 'indoor_hotspot', 'seed': 42},
-        {'name': 'dense_urban', 'seed': 42},
-        {'name': 'rural', 'seed': 42},
-        {'name': 'urban_macro', 'seed': 42},
-    ]
+    # Load scenarios from directory
+    suite = load_scenarios_from_directory(scenarios_dir)
+    
+    if not suite:
+        print(f'Error: No scenario files found in {scenarios_dir}/')
+        return
     
     energies = []
     
     print(f'\n=== Running Benchmark Suite ({len(suite)} scenarios) ===')
-    print(f'Using {n_parallel_envs} parallel environments per scenario\n')
+    print(f'Scenarios directory: {scenarios_dir}/')
+    print(f'Using {n_parallel_envs} parallel environments per scenario')
+    print(f'Loaded scenarios: {[s["name"] for s in suite]}\n')
     
     for i, scenario_config in enumerate(suite, 1):
         name = scenario_config['name']
@@ -41,7 +67,8 @@ def main(n_parallel_envs: int = 4):
             results = run_scenario_with_rl_agent_parallel(
                 scenario=name, 
                 seed=seed,
-                n_envs=n_parallel_envs
+                n_envs=n_parallel_envs,
+                scenarios_dir=scenarios_dir
             )
             
             if results['violated']:
@@ -72,7 +99,7 @@ def main(n_parallel_envs: int = 4):
         print(f'  Scenario {i} ({scenario_config["name"]}): {energy:.6f} kWh')
 
 
-def run_scenario_with_rl_agent_parallel(scenario: str, seed: int, n_envs: int = 4):
+def run_scenario_with_rl_agent_parallel(scenario: str, seed: int, n_envs: int = 4, scenarios_dir: str = None):
     """
     Run scenario with RL agent using parallel environments
     
@@ -80,6 +107,7 @@ def run_scenario_with_rl_agent_parallel(scenario: str, seed: int, n_envs: int = 
         scenario: Scenario name
         seed: Base random seed
         n_envs: Number of parallel environments
+        scenarios_dir: Custom scenarios directory path
     
     Returns:
         Results dictionary from the first environment (primary)
@@ -90,13 +118,14 @@ def run_scenario_with_rl_agent_parallel(scenario: str, seed: int, n_envs: int = 
         n_envs=n_envs,
         scenario=scenario,
         base_seed=seed,
-        max_steps=None  # Use scenario default
+        max_steps=None,  # Use scenario default
+        scenarios_dir=scenarios_dir  # Pass custom scenarios directory
     )
     
     # Check if scenario has valid simTime
     # We'll use the first environment's params
     from simulation import FiveGEnvironment
-    test_env = FiveGEnvironment(scenario=scenario, seed=seed)
+    test_env = FiveGEnvironment(scenario=scenario, seed=seed, scenarios_dir=scenarios_dir)
     
     if test_env.sim_params.sim_time <= 0:
         print(f'Skipping scenario {scenario}: simTime={test_env.sim_params.sim_time}')
@@ -216,8 +245,10 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Run scenarios with parallel environments')
     parser.add_argument('--n-envs', type=int, default=4,
                        help='Number of parallel environments per scenario (default: 4)')
+    parser.add_argument('--scenarios-dir', type=str, default='scenarios',
+                       help='Directory containing scenario files (default: scenarios)')
     
     args = parser.parse_args()
     
-    main(n_parallel_envs=args.n_envs)
+    main(n_parallel_envs=args.n_envs, scenarios_dir=args.scenarios_dir)
 

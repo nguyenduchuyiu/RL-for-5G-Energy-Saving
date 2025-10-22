@@ -17,12 +17,12 @@ from .metrics import compute_energy_saving_metrics, create_rl_state
 class FiveGEnvironment:
     """5G Network simulation environment (compatible with RL agents)"""
     
-    def __init__(self, scenario: str = 'indoor_hotspot', seed: int = 42):
+    def __init__(self, scenario: str = 'indoor_hotspot', seed: int = 42, scenarios_dir: str = None):
         self.scenario_name = scenario
         self.seed_value = seed
         
         # Load scenario configuration
-        self.sim_params = load_scenario_config(scenario)
+        self.sim_params = load_scenario_config(scenario, scenarios_dir=scenarios_dir)
         
         # Initialize network components
         self.sites: List[Site] = []

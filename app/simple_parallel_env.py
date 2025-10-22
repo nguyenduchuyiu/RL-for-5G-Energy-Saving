@@ -28,11 +28,12 @@ class SimpleParallelEnv:
     """
     
     def __init__(self, n_envs: int, scenario: str = 'indoor_hotspot', 
-                 base_seed: int = 42, max_steps: int = None):
+                 base_seed: int = 42, max_steps: int = None, scenarios_dir: str = None):
         self.n_envs = n_envs
         self.scenario = scenario
         self.base_seed = base_seed
         self.max_steps = max_steps
+        self.scenarios_dir = scenarios_dir
         
         # Create pipes for communication with worker processes
         self.parent_conns, self.child_conns = zip(*[mp.Pipe() for _ in range(n_envs)])
@@ -42,7 +43,7 @@ class SimpleParallelEnv:
         for idx in range(n_envs):
             p = mp.Process(
                 target=self._worker,
-                args=(idx, self.child_conns[idx], scenario, base_seed + idx, max_steps)
+                args=(idx, self.child_conns[idx], scenario, base_seed + idx, max_steps, scenarios_dir)
             )
             p.daemon = True
             p.start()
@@ -58,10 +59,10 @@ class SimpleParallelEnv:
         print(f"  Obs dim: {self.obs_dim}")
     
     @staticmethod
-    def _worker(idx: int, conn, scenario: str, seed: int, max_steps: int = None):
+    def _worker(idx: int, conn, scenario: str, seed: int, max_steps: int = None, scenarios_dir: str = None):
         """Worker process running a single environment"""
         # Create environment in worker process
-        env = FiveGEnvironment(scenario=scenario, seed=seed)
+        env = FiveGEnvironment(scenario=scenario, seed=seed, scenarios_dir=scenarios_dir)
         
         if max_steps is not None:
             env.sim_params.total_steps = max_steps

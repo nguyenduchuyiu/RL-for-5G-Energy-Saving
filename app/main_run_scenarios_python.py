@@ -4,6 +4,8 @@ Run all scenarios with RL agent and output energies.txt
 Python port of main_run_scenarios.m
 """
 
+import glob
+import os
 import sys
 from pathlib import Path
 
@@ -13,17 +15,37 @@ sys.path.insert(0, str(Path(__file__).parent))
 from simulation import FiveGEnvironment
 from energy_agent import RLAgent
 
+def load_scenarios_from_directory(scenarios_dir: str = 'scenarios', base_seed: int = 42):
+    """
+    Load all scenario files from directory
+    
+    Args:
+        scenarios_dir: Directory containing scenario JSON files
+        base_seed: Base seed for scenarios
+    
+    Returns:
+        List of scenario configs with name and seed
+    """
+    # Get all JSON files in scenarios directory
+    scenario_files = sorted(glob.glob(os.path.join(scenarios_dir, '*.json')))
+    
+    suite = []
+    for scenario_file in scenario_files:
+        # Extract scenario name from filename (remove .json extension)
+        scenario_name = Path(scenario_file).stem
+        suite.append({'name': scenario_name, 'seed': base_seed})
+    
+    return suite
 
-def main():
+def main(scenarios_dir: str = 'scenarios', base_seed: int = 42):
     """Run all scenarios and generate energies.txt"""
     
-    # Define test suite (matching opts.txt format)
-    suite = [
-        {'name': 'indoor_hotspot', 'seed': 42},
-        {'name': 'dense_urban', 'seed': 42},
-        {'name': 'rural', 'seed': 42},
-        {'name': 'urban_macro', 'seed': 42},
-    ]
+    # Load scenarios from directory
+    suite = load_scenarios_from_directory(scenarios_dir, base_seed)
+    
+    if not suite:
+        print(f'Error: No scenario files found in {scenarios_dir}/')
+        return
     
     energies = []
     
@@ -36,7 +58,7 @@ def main():
         print(f'\n--- Scenario {i}/{len(suite)}: {name} ---')
         
         try:
-            results = run_scenario_with_rl_agent(scenario=name, seed=seed)
+            results = run_scenario_with_rl_agent(scenario=name, seed=seed, scenarios_dir=scenarios_dir)
             
             if results['violated']:
                 print(f'⚠️  Scenario {name} has {results["kpi_violations"]} KPI violations.')
@@ -66,11 +88,11 @@ def main():
         print(f'  Scenario {i} ({scenario_config["name"]}): {energy:.6f} kWh')
 
 
-def run_scenario_with_rl_agent(scenario: str, seed: int):
+def run_scenario_with_rl_agent(scenario: str, seed: int, scenarios_dir: str = None):
     """Run scenario with RL agent"""
     
     # Create environment
-    env = FiveGEnvironment(scenario=scenario, seed=seed)
+    env = FiveGEnvironment(scenario=scenario, seed=seed, scenarios_dir=scenarios_dir)
     
     # Skip scenario if simTime is 0 or negative
     if env.sim_params.sim_time <= 0:
@@ -138,5 +160,14 @@ def write_energies_file(energies):
 
 
 if __name__ == '__main__':
-    main()
+    import argparse
+    
+    parser = argparse.ArgumentParser(description='Run scenarios with RL agent')
+    parser.add_argument('--scenarios-dir', type=str, default='scenarios',
+                       help='Directory containing scenario files (default: scenarios)')
+    parser.add_argument('--base-seed', type=int, default=42,
+                       help='Base seed for scenarios (default: 42)')
+    
+    args = parser.parse_args()
+    main(scenarios_dir=args.scenarios_dir, base_seed=args.base_seed)
 

@@ -80,8 +80,8 @@ class RLAgent:
         # Experience buffer
         self.buffer = TrajectoryBuffer()
         
-        self.step_per_episode = config['step_per_episode']
-        self.total_episodes = int(self.max_time / self.step_per_episode)
+        self.step_per_episode = config['buffer_size'] // config['n_envs']
+        self.total_episodes = int(self.max_time / self.step_per_episode) * config['n_envs']
         self.current_episode = 1
         
         self.current_padded_action = np.ones(self.max_cells) * 0.7
@@ -525,9 +525,35 @@ class RLAgent:
             excess = max_prb_usage - prb_threshold
             prb_penalty = self.violation_event_penalty - self.prb_magnitude_penalty_coef * (excess**2)
 
-        # --- Reward for Improvement (Always) ---
-        drop_improvement = self.improvement_coeff * (prev_drop_rate - current_drop_rate)
-        latency_improvement = self.improvement_coeff * (prev_latency - current_latency) * 0.1
+        # --- Reward for Improvement (MODIFIED V2) ---
+
+        # 1. Define "Safe Zones" (e.g., 80% or 90% of the threshold)
+        safe_drop_threshold = drop_threshold * 0.9
+        safe_latency_threshold = latency_threshold * 0.9
+
+        # 2. Calculate improvement value as before
+        drop_improvement_val = prev_drop_rate - current_drop_rate
+        latency_improvement_val = (prev_latency - current_latency) * 0.1
+        
+        drop_improvement = 0.0
+        latency_improvement = 0.0
+
+        # 3. LOGIC MỚI: Chỉ tính 'improvement' (thưởng hoặc phạt)
+        #    nếu state (trước hoặc sau) nằm ngoài vùng an toàn.
+        
+        if (prev_drop_rate > safe_drop_threshold) or (current_drop_rate > safe_drop_threshold):
+            # Nếu state trước (prev) KHÔNG an toàn, HOẶC state hiện tại (current) KHÔNG an toàn
+            # thì chúng ta mới "quan tâm" đến việc di chuyển (improvement/degradation).
+            drop_improvement = self.improvement_coeff * drop_improvement_val
+        
+        # Ngược lại (else):
+        # Nếu cả prev_drop_rate VÀ current_drop_rate đều NẰM TRONG vùng an toàn
+        # (ví dụ: 0.5% và 0.8%, đều < 0.9%)
+        # thì drop_improvement = 0.0.
+        # Agent sẽ không bị phạt khi đi từ 0.5% -> 0.8%.
+        
+        if (prev_latency > safe_latency_threshold) or (current_latency > safe_latency_threshold):
+            latency_improvement = self.improvement_coeff * latency_improvement_val
 
         # --- Total Reward ---
         total_reward = (

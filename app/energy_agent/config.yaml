@@ -1,6 +1,6 @@
-training_mode: True
+training_mode: False
 use_gpu: True
-checkpoint_path: "app/energy_agent/models/ppo_model_10240.pth"
+checkpoint_path: "app/energy_agent/models/ppo_model.pth"
 
 actor_lr: 0.0001
 critic_lr: 0.0003
@@ -21,5 +21,6 @@ clip_epsilon: 0.2
 ppo_epochs: 8
 batch_size: 64
 buffer_size: 2048
-step_per_episode: 2048 # same as buffer_size
+n_envs: 4
 hidden_dim: 256
+

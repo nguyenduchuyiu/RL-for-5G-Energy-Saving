@@ -87,6 +87,9 @@ def load_scenario_config(scenario_input: str, scenarios_dir: Optional[Path] = No
     if scenarios_dir is None:
         # Default to app/scenarios/
         scenarios_dir = Path(__file__).parent.parent / 'scenarios'
+    elif isinstance(scenarios_dir, str):
+        # Convert string to Path
+        scenarios_dir = Path(scenarios_dir)
     
     # Resolve JSON file path
     json_path = _resolve_scenario_path(scenario_input, scenarios_dir)
