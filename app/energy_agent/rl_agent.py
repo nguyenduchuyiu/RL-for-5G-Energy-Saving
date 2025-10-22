@@ -81,14 +81,13 @@ class RLAgent:
         self.buffer = TrajectoryBuffer()
         
         self.step_per_episode = config['buffer_size'] // config['n_envs']
-        self.total_episodes = int(self.max_time / self.step_per_episode) * config['n_envs']
+        self.total_episodes = int(self.max_time / self.step_per_episode)
         self.current_episode = 1
         
         self.current_padded_action = np.ones(self.max_cells) * 0.7
         self.last_padded_action = self.current_padded_action
         self.last_padded_action = np.zeros(self.action_dim)
         self.last_log_prob = np.zeros(1)
-        self.current_step = 0
         
         # Metrics tracking
         self.metrics = {'drop_rate': [], 'latency': [], 'energy_efficiency_reward': [], 'drop_penalty': [], 
@@ -345,15 +344,16 @@ class RLAgent:
         self.logger.addHandler(console_handler)
     
     def start_scenario(self):
-        print("Starting scenario...")
+        print("===================Starting scenario===================")
+        self.start_episode()
     
     def end_scenario(self):
-        print("Ending scenario...")
+        print("===================Ending scenario===================")
         self.save_plots()
         self.save_model(self.checkpoint_path)
     
     def start_episode(self):
-        print(f"Starting episode: {self.current_episode}")
+        print(f"===================Starting episode: {self.current_episode}===================")
         self.episodic_metrics['total_reward'] = 0.0
         self.episodic_metrics['drop_penalty'] = 0.0
         self.episodic_metrics['latency_penalty'] = 0.0
@@ -373,6 +373,7 @@ class RLAgent:
 
     
     def end_episode(self):
+        print(f"=====================Ending episode: {self.current_episode}=====================")
         self.logger.info(f"Episode ={self.current_episode},\n"
                          f"Episode Reward={self.episodic_metrics['total_reward']:.2f},\n"
                          f"Drop Penalty={self.episodic_metrics['drop_penalty']:.2f},\n"
@@ -387,8 +388,7 @@ class RLAgent:
         )        
         self.train()
         self.current_episode += 1
-        
-        if self.current_episode <= self.total_episodes:
+        if self.current_episode < self.total_episodes:
             self.start_episode()
     
     # NOT REMOVED FOR INTERACTING WITH SIMULATION (CAN BE MODIFIED)
@@ -650,10 +650,8 @@ class RLAgent:
         
         # update last padded action
         self.last_padded_action = self.current_padded_action
-        
-        self.current_step += 1
-        
-        if self.current_step % self.step_per_episode == 0 and self.training_mode:
+                
+        if len(self.buffer) >= self.buffer_size and self.training_mode:
             self.end_episode()
             
     
@@ -788,9 +786,6 @@ class RLAgent:
         self.critic.load_state_dict(checkpoint['critic_state_dict'])
         self.actor_optimizer.load_state_dict(checkpoint['actor_optimizer_state_dict'])
         self.critic_optimizer.load_state_dict(checkpoint['critic_optimizer_state_dict'])
-        
-        self.total_episodes = checkpoint.get('total_episodes', 0)
-        self.total_steps = checkpoint.get('total_steps', 0)
         
         self.logger.info(f"Model loaded from {filepath}")
     

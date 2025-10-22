@@ -1,6 +1,6 @@
-training_mode: False
+training_mode: True
 use_gpu: True
-checkpoint_path: "app/energy_agent/models/ppo_model.pth"
+checkpoint_path: "app/energy_agent/models/ppo_model_6k.pth"
 
 actor_lr: 0.0001
 critic_lr: 0.0003
@@ -23,4 +23,3 @@ batch_size: 64
 buffer_size: 2048
 n_envs: 4
 hidden_dim: 256
-
