@@ -39,8 +39,8 @@ class RLAgent:
         
         self.original_state_dim = 17 + 14 + (self.max_cells * 12)
         
-        # 10 global features + 2*max_cells local features
-        self.state_dim = self.original_state_dim + 10 + 2*self.max_cells
+        # 9 global features + 2*max_cells local features
+        self.state_dim = self.original_state_dim + 9 + 2*self.max_cells
         
         # Power ratio for each cell
         self.action_dim = self.max_cells
@@ -132,16 +132,15 @@ class RLAgent:
             'power_efficiency': [0, 1000],
             'load_deltas': [-500, 500],
             'ue_deltas': [-50, 50],
-            'total_energy_consumption': [0, 10000],
         }
 
         def normalize(val, min_v, max_v):
             val = np.clip(val, min_v, max_v)
             return (val - min_v) / (max_v - min_v + 1e-8)
 
-        global_features = raw_new_features[:10]
-        load_deltas = raw_new_features[10 : 10 + self.n_cells]
-        ue_deltas = raw_new_features[10 + self.n_cells :]
+        global_features = raw_new_features[:9]
+        load_deltas = raw_new_features[9 : 9 + self.n_cells]
+        ue_deltas = raw_new_features[9 + self.n_cells :]
 
         norm_global = np.array([
             normalize(global_features[0], *bounds['ue_density']),
@@ -153,7 +152,6 @@ class RLAgent:
             normalize(global_features[6], *bounds['dist_to_prb_thresh']),
             normalize(global_features[7], *bounds['load_per_active_cell']),
             normalize(global_features[8], *bounds['power_efficiency']),
-            normalize(global_features[9], *bounds['total_energy_consumption']),
         ])
         
         norm_load_deltas = normalize(load_deltas, *bounds['load_deltas'])
@@ -226,9 +224,6 @@ class RLAgent:
         # Load-Power efficiency: how much traffic is served per Watt of transmit power
         power_efficiency = total_traffic / (total_tx_power + 1e-6)
         
-        # total energy consumption
-        total_energy_consumption = self.episodic_metrics['total_energy_consumption']
-        
         # Local correlation features (Hotspot/Coldspot)
         load_deltas = all_cell_loads - avg_cell_load
         ue_deltas = all_cell_ues - avg_cell_ues
@@ -237,7 +232,7 @@ class RLAgent:
             np.array([
             ue_density, isd, base_power, 
             dist_to_drop_thresh, dist_to_latency_thresh, dist_to_cpu_thresh, dist_to_prb_thresh,
-            load_per_active_cell, power_efficiency, total_energy_consumption
+            load_per_active_cell, power_efficiency
             ]), 
             load_deltas, 
             ue_deltas
@@ -504,7 +499,8 @@ class RLAgent:
         
         self.episodic_metrics['total_energy_consumption'] += energy_kwh
 
-        energy_consumption_penalty = config['energy_consumption_penalty'] * self.episodic_metrics['total_energy_consumption']
+        # Penalize energy consumption per step, not total accumulated
+        energy_consumption_penalty = config['energy_consumption_penalty'] * energy_kwh
 
         # --- Penalty for Drop Rate (Combined) ---
         drop_penalty, latency_penalty, cpu_penalty, prb_penalty = 0.0, 0.0, 0.0, 0.0
@@ -566,6 +562,16 @@ class RLAgent:
             + latency_improvement
             + energy_consumption_penalty
         )
+        
+        print("total_reward: ", total_reward)
+        print("energy_efficiency_reward: ", energy_efficiency_reward)
+        print("drop_penalty: ", drop_penalty)
+        print("latency_penalty: ", latency_penalty)
+        print("cpu_penalty: ", cpu_penalty)
+        print("prb_penalty: ", prb_penalty)
+        print("drop_improvement: ", drop_improvement)
+        print("latency_improvement: ", latency_improvement)
+        print("energy_consumption_penalty: ", energy_consumption_penalty)
         
         # Update episodic metrics
         self.episodic_metrics['total_reward'] += total_reward
