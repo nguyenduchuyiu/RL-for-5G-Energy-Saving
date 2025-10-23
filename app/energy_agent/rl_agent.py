@@ -563,16 +563,6 @@ class RLAgent:
             + energy_consumption_penalty
         )
         
-        print("total_reward: ", total_reward)
-        print("energy_efficiency_reward: ", energy_efficiency_reward)
-        print("drop_penalty: ", drop_penalty)
-        print("latency_penalty: ", latency_penalty)
-        print("cpu_penalty: ", cpu_penalty)
-        print("prb_penalty: ", prb_penalty)
-        print("drop_improvement: ", drop_improvement)
-        print("latency_improvement: ", latency_improvement)
-        print("energy_consumption_penalty: ", energy_consumption_penalty)
-        
         # Update episodic metrics
         self.episodic_metrics['total_reward'] += total_reward
         self.episodic_metrics['drop_penalty'] += drop_penalty
