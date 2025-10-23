@@ -45,8 +45,10 @@ class RLAgent:
         # Power ratio for each cell
         self.action_dim = self.max_cells
                 
-        self.actor_hidden_state = None
-        self.critic_hidden_state = None
+        # Hidden states for each parallel environment
+        self.n_envs = config['n_envs']
+        self.actor_hidden_states = {i: None for i in range(self.n_envs)}
+        self.critic_hidden_states = {i: None for i in range(self.n_envs)}
                 
         # PPO hyperparameters
         self.gamma = config['gamma']
@@ -84,10 +86,9 @@ class RLAgent:
         self.total_episodes = int(self.max_time / self.step_per_episode)
         self.current_episode = 1
         
-        self.current_padded_action = np.ones(self.max_cells) * 0.7
-        self.last_padded_action = self.current_padded_action
-        self.last_padded_action = np.zeros(self.action_dim)
-        self.last_log_prob = np.zeros(1)
+        # Per-environment action and log_prob tracking
+        self.current_padded_actions = {i: np.ones(self.max_cells) * 0.7 for i in range(self.n_envs)}
+        self.last_log_probs = {i: np.zeros(1) for i in range(self.n_envs)}
         
         # Metrics tracking
         self.metrics = {'drop_rate': [], 'latency': [], 'energy_efficiency_reward': [], 'drop_penalty': [], 
@@ -360,26 +361,27 @@ class RLAgent:
         self.episodic_metrics['total_energy_consumption'] = 0.0
         self.episodic_metrics['energy_consumption_penalty'] = 0.0
         
-        self.actor_hidden_state = None
-        self.critic_hidden_state = None
-        
-        self.last_padded_action = np.ones(self.max_cells) * 0.7
-        self.current_padded_action = self.last_padded_action.copy()
+        # Reset hidden states for all envs
+        for i in range(self.n_envs):
+            self.actor_hidden_states[i] = None
+            self.critic_hidden_states[i] = None
+            self.current_padded_actions[i] = np.ones(self.max_cells) * 0.7
+            self.last_log_probs[i] = np.zeros(1)
 
     
     def end_episode(self):
         print(f"=====================Ending episode: {self.current_episode}=====================")
         self.logger.info(f"Episode ={self.current_episode},\n"
-                         f"Episode Reward={self.episodic_metrics['total_reward']:.2f},\n"
-                         f"Drop Penalty={self.episodic_metrics['drop_penalty']:.2f},\n"
-                         f"Latency Penalty={self.episodic_metrics['latency_penalty']:.2f},\n"
-                         f"CPU Penalty={self.episodic_metrics['cpu_penalty']:.2f},\n"
-                         f"PRB Penalty={self.episodic_metrics['prb_penalty']:.2f},\n"
-                         f"Drop Improvement={self.episodic_metrics['drop_improvement']:.2f},\n"
-                         f"Latency Improvement={self.episodic_metrics['latency_improvement']:.2f},\n"
-                         f"Energy Efficiency Reward={self.episodic_metrics['energy_efficiency_reward']:.2f},\n"
-                         f"Total Energy Consumption={self.episodic_metrics['total_energy_consumption']:.2f},\n"
-                         f"Energy Consumption Penalty={self.episodic_metrics['energy_consumption_penalty']:.2f},\n"
+                         f"Episode Reward={self.episodic_metrics['total_reward']/config['n_envs']:.2f},\n"
+                         f"Drop Penalty={self.episodic_metrics['drop_penalty']/config['n_envs']:.2f},\n"
+                         f"Latency Penalty={self.episodic_metrics['latency_penalty']/config['n_envs']:.2f},\n"
+                         f"CPU Penalty={self.episodic_metrics['cpu_penalty']/config['n_envs']:.2f},\n"
+                         f"PRB Penalty={self.episodic_metrics['prb_penalty']/config['n_envs']:.2f},\n"
+                         f"Drop Improvement={self.episodic_metrics['drop_improvement']/config['n_envs']:.2f},\n"
+                         f"Latency Improvement={self.episodic_metrics['latency_improvement']/config['n_envs']:.2f},\n"
+                         f"Energy Efficiency Reward={self.episodic_metrics['energy_efficiency_reward']/config['n_envs']:.2f},\n"
+                         f"Total Energy Consumption={self.episodic_metrics['total_energy_consumption']/config['n_envs']:.2f},\n"
+                         f"Energy Consumption Penalty={self.episodic_metrics['energy_consumption_penalty']/config['n_envs']:.2f},\n"
         )        
         self.train()
         self.current_episode += 1
@@ -387,12 +389,13 @@ class RLAgent:
             self.start_episode()
     
     # NOT REMOVED FOR INTERACTING WITH SIMULATION (CAN BE MODIFIED)
-    def get_action(self, state):
+    def get_action(self, state, env_id=0):
         """
         Get action from policy network
         
         Args:
             state: State vector from MATLAB interface
+            env_id: ID of the environment (for parallel envs)
             
         Returns:
             action: Power ratios for each cell [0, 1]
@@ -407,8 +410,8 @@ class RLAgent:
         
         with torch.no_grad():
             
-            action_mean, action_logstd, next_actor_hidden = self.actor(state_tensor, self.actor_hidden_state)
-            self.actor_hidden_state = next_actor_hidden
+            action_mean, action_logstd, next_actor_hidden = self.actor(state_tensor, self.actor_hidden_states[env_id])
+            self.actor_hidden_states[env_id] = next_actor_hidden
             
             if self.training_mode:
                 # Sample from policy during training
@@ -431,21 +434,20 @@ class RLAgent:
         else:
             avg_log_prob = 0.0
         
-        # update current padded action
-        self.current_padded_action = action.cpu().numpy().flatten()
+        # update current padded action for this env
+        self.current_padded_actions[env_id] = action.cpu().numpy().flatten()
         
         # truncate action to n_cells length
         truncated_action = action.squeeze()[:self.n_cells]
         
-        # Store for experience replay
-        self.last_padded_state = state
-        self.last_log_prob = np.array([avg_log_prob])
+        # Store log_prob for this env
+        self.last_log_probs[env_id] = np.array([avg_log_prob])
         
         # return truncated action for environment
         return truncated_action.cpu().numpy().flatten()
     
     ## OPTIONAL: Modify reward calculation as needed
-    def calculate_reward(self, prev_state, action, current_state):
+    def calculate_reward(self, prev_state, action, current_state, env_id=0):
         """
         Calculate reward based on energy efficiency and QoS constraints.
         
@@ -453,6 +455,7 @@ class RLAgent:
             prev_state: Previous state vector
             action: Action taken (power ratios)
             current_state: Current state vector
+            env_id: ID of the environment
             
         Returns:
             float: Calculated reward value
@@ -563,7 +566,7 @@ class RLAgent:
             + energy_consumption_penalty
         )
         
-        # Update episodic metrics
+        # Update episodic metrics (accumulated from all envs)
         self.episodic_metrics['total_reward'] += total_reward
         self.episodic_metrics['drop_penalty'] += drop_penalty
         self.episodic_metrics['latency_penalty'] += latency_penalty
@@ -574,23 +577,23 @@ class RLAgent:
         self.episodic_metrics['energy_consumption_penalty'] += energy_consumption_penalty
         self.episodic_metrics['energy_efficiency_reward'] += energy_efficiency_reward
         
-        
-        # Track metrics
-        self.metrics['drop_rate'].append(current_drop_rate)
-        self.metrics['latency'].append(current_latency)
-        self.metrics['energy_efficiency_reward'].append(energy_efficiency_reward)
-        self.metrics['drop_penalty'].append(drop_penalty)
-        self.metrics['latency_penalty'].append(latency_penalty)
-        self.metrics['cpu_penalty'].append(cpu_penalty)
-        self.metrics['prb_penalty'].append(prb_penalty)
-        self.metrics['drop_improvement'].append(drop_improvement)
-        self.metrics['latency_improvement'].append(latency_improvement)
-        self.metrics['total_reward'].append(total_reward)
+        # Track metrics only for env 0 to avoid 4x duplication in plots
+        if env_id == 0:
+            self.metrics['drop_rate'].append(current_drop_rate)
+            self.metrics['latency'].append(current_latency)
+            self.metrics['energy_efficiency_reward'].append(energy_efficiency_reward)
+            self.metrics['drop_penalty'].append(drop_penalty)
+            self.metrics['latency_penalty'].append(latency_penalty)
+            self.metrics['cpu_penalty'].append(cpu_penalty)
+            self.metrics['prb_penalty'].append(prb_penalty)
+            self.metrics['drop_improvement'].append(drop_improvement)
+            self.metrics['latency_improvement'].append(latency_improvement)
+            self.metrics['total_reward'].append(total_reward)
 
         return total_reward
     
     # NOT REMOVED FOR INTERACTING WITH SIMULATION (CAN BE MODIFIED)
-    def update(self, state, action, next_state, done):
+    def update(self, state, action, next_state, done, env_id=0):
         """
         Update agent with experience
         
@@ -599,15 +602,16 @@ class RLAgent:
             action: Action taken
             next_state: Next state
             done: Whether episode is done
+            env_id: ID of the environment (for parallel envs)
         """
         if not self.training_mode:
             return
         
         # pad action to max_cells length from raw action vector
-        padded_action = self.current_padded_action
+        padded_action = self.current_padded_actions[env_id]
         
         # Calculate actual reward using raw state
-        actual_reward = self.calculate_reward(state, padded_action, next_state)
+        actual_reward = self.calculate_reward(state, padded_action, next_state, env_id)
         
         # Convert inputs to numpy if needed
         if hasattr(state, 'numpy'):
@@ -627,10 +631,10 @@ class RLAgent:
         state_tensor = torch.FloatTensor(state).unsqueeze(0).unsqueeze(0).to(self.device)
         
         with torch.no_grad():
-            value_tensor, next_critic_hidden = self.critic(state_tensor, self.critic_hidden_state)
+            value_tensor, next_critic_hidden = self.critic(state_tensor, self.critic_hidden_states[env_id])
             value = value_tensor.item()
             
-            self.critic_hidden_state = next_critic_hidden
+            self.critic_hidden_states[env_id] = next_critic_hidden
         
         # Create transition
         transition = Transition(
@@ -638,14 +642,12 @@ class RLAgent:
             action=action,
             reward=actual_reward,
             done=done,
-            log_prob=getattr(self, 'last_log_prob', np.array([0.0]))[0],
-            value=value
+            log_prob=self.last_log_probs[env_id][0],
+            value=value,
+            env_id=env_id
         )
                 
         self.buffer.add(transition)
-        
-        # update last padded action
-        self.last_padded_action = self.current_padded_action
                 
         if len(self.buffer) >= self.buffer_size and self.training_mode:
             self.end_episode()
@@ -669,20 +671,47 @@ class RLAgent:
     
     def train(self):
         # SỬA ĐỔI: Lấy dữ liệu từ buffer mới
-        states, actions, rewards, dones, old_log_probs, values = self.buffer.get_all_and_clear()
-        # Tính next_value cho transition cuối cùng trong batch
-        last_state = torch.FloatTensor(states[-1]).unsqueeze(0).unsqueeze(0).to(self.device)
-        with torch.no_grad():
-            next_value, _ = self.critic(last_state, self.critic_hidden_state)
-            next_value = next_value.squeeze()
-
+        states, actions, rewards, dones, old_log_probs, values, env_ids = self.buffer.get_all_and_clear()
+        
         # Chuyển dữ liệu sang tensor
         rewards_tensor = torch.FloatTensor(rewards).to(self.device)
         values_tensor = torch.FloatTensor(values).to(self.device)
         dones_tensor = torch.FloatTensor(dones).to(self.device)
+        env_ids_np = np.array(env_ids)
 
-        # Tính GAE
-        advantages, returns = self.compute_gae_for_trajectory(rewards_tensor, values_tensor, dones_tensor, next_value)
+        # Tính GAE riêng cho từng environment để tránh bootstrap sai giữa các env
+        unique_env_ids = np.unique(env_ids_np)
+        all_advantages = torch.zeros_like(rewards_tensor)
+        all_returns = torch.zeros_like(values_tensor)
+        
+        for env_id in unique_env_ids:
+            # Lấy indices của env này
+            env_mask = env_ids_np == env_id
+            env_indices = np.where(env_mask)[0]
+            
+            # Extract data cho env này
+            env_rewards = rewards_tensor[env_mask]
+            env_values = values_tensor[env_mask]
+            env_dones = dones_tensor[env_mask]
+            
+            # Tính next_value cho transition cuối của env này
+            last_idx = env_indices[-1]
+            last_state = torch.FloatTensor(states[last_idx]).unsqueeze(0).unsqueeze(0).to(self.device)
+            with torch.no_grad():
+                next_value, _ = self.critic(last_state, None)  # No hidden state for last value
+                next_value = next_value.squeeze()
+            
+            # Tính GAE cho env này
+            env_advantages, env_returns = self.compute_gae_for_trajectory(
+                env_rewards, env_values, env_dones, next_value
+            )
+            
+            # Gán vào vị trí tương ứng
+            all_advantages[env_mask] = env_advantages
+            all_returns[env_mask] = env_returns
+        
+        advantages = all_advantages
+        returns = all_returns
         
         # Gộp dữ liệu thành batch lớn
         states_tensor = torch.FloatTensor(states).to(self.device)

@@ -170,7 +170,7 @@ def run_scenario_with_rl_agent_parallel(scenario: str, seed: int, n_envs: int = 
         actions = []
         for i in range(n_envs):
             if not dones[i]:
-                action = agent.get_action(obs[i])
+                action = agent.get_action(obs[i], env_id=i)
                 actions.append(action)
             else:
                 # Environment is done, send dummy action
@@ -184,7 +184,7 @@ def run_scenario_with_rl_agent_parallel(scenario: str, seed: int, n_envs: int = 
         # Update agent with experiences from all environments
         for i in range(n_envs):
             if not dones[i]:
-                agent.update(obs[i], actions[i], next_obs[i], new_dones[i])
+                agent.update(obs[i], actions[i], next_obs[i], new_dones[i], env_id=i)
         
         # Update done flags
         dones = np.logical_or(dones, new_dones)

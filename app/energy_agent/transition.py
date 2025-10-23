@@ -2,9 +2,9 @@
 import numpy as np
 from collections import namedtuple
 
-# Transition vẫn giữ nguyên
+# Transition with env_id to track which environment it came from
 Transition = namedtuple('Transition', [
-    'state', 'action', 'reward', 'done', 'log_prob', 'value'
+    'state', 'action', 'reward', 'done', 'log_prob', 'value', 'env_id'
 ])
 
 class TrajectoryBuffer:
@@ -29,8 +29,9 @@ class TrajectoryBuffer:
         dones = np.array([t.done for t in batch])
         log_probs = np.array([t.log_prob for t in batch])
         values = np.array([t.value for t in batch])
+        env_ids = np.array([t.env_id for t in batch])
         
-        return states, actions, rewards, dones, log_probs, values
+        return states, actions, rewards, dones, log_probs, values, env_ids
 
     def __len__(self):
         return len(self.memory)
