@@ -129,7 +129,7 @@ class RLAgent:
 
         bounds = {
             # Reuse from StateNormalizer.simulation_bounds
-            'ue_density': [0, 200/50],          # max_ues / max_cells
+            'ue_density': [0, 20],          
             'isd': [100, 2000],                 # Same as StateNormalizer
             'base_power': [100, 1000],          # Same as StateNormalizer
             
