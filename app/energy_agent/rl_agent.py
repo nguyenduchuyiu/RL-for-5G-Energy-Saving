@@ -39,16 +39,14 @@ class RLAgent:
         
         self.original_state_dim = 17 + 14 + (self.max_cells * 12)
         
-        # 9 global features + 2*max_cells local features
-        self.state_dim = self.original_state_dim + 9 + 2*self.max_cells
+        # 9 global features + 4 delta features + 2*max_cells local features
+        self.state_dim = self.original_state_dim + 9 + 4 + 2*self.max_cells
         
         # Power ratio for each cell
         self.action_dim = self.max_cells
                 
-        # Hidden states for each parallel environment
+        # Number of parallel environments
         self.n_envs = config['n_envs']
-        self.actor_hidden_states = {i: None for i in range(self.n_envs)}
-        self.critic_hidden_states = {i: None for i in range(self.n_envs)}
                 
         # PPO hyperparameters
         self.gamma = config['gamma']
@@ -90,6 +88,9 @@ class RLAgent:
         self.current_padded_actions = {i: np.ones(self.max_cells) * 0.7 for i in range(self.n_envs)}
         self.last_log_probs = {i: np.zeros(1) for i in range(self.n_envs)}
         
+        # Track previous state for delta features (temporal info)
+        self.prev_states = {i: None for i in range(self.n_envs)}
+        
         # Metrics tracking
         self.metrics = {'drop_rate': [], 'latency': [], 'energy_efficiency_reward': [], 'drop_penalty': [], 
                        'latency_penalty': [], 'cpu_penalty': [], 'prb_penalty': [], 'drop_improvement': [], 
@@ -118,30 +119,44 @@ class RLAgent:
         else:
             self.logger.info(f"No checkpoint found at {self.checkpoint_path}")
         
-    def normalize_augmented_features(self, raw_new_features):
-        """Normalizes only the newly created features using predefined bounds."""
+    def normalize_augmented_features(self, global_features, 
+                                     load_deltas, ue_deltas, 
+                                     delta_features):
+        """Normalizes only the newly created features using predefined bounds.
+        
+        Uses consistent bounds with StateNormalizer where applicable.
+        """
 
         bounds = {
-            'ue_density': [0, 50],
-            'isd': [0, 2000],
-            'base_power': [0, 1500],
-            'dist_to_drop_thresh': [-10, 10],
-            'dist_to_latency_thresh': [-100, 100],
-            'dist_to_cpu_thresh': [-100, 100],
-            'dist_to_prb_thresh': [-100, 100],
-            'load_per_active_cell': [0, 5000],
-            'power_efficiency': [0, 1000],
-            'load_deltas': [-500, 500],
-            'ue_deltas': [-50, 50],
+            # Reuse from StateNormalizer.simulation_bounds
+            'ue_density': [0, 200/50],          # max_ues / max_cells
+            'isd': [100, 2000],                 # Same as StateNormalizer
+            'base_power': [100, 1000],          # Same as StateNormalizer
+            
+            # Distance to thresholds (new features)
+            'dist_to_drop_thresh': [-20, 10],  # Can go negative (over threshold)
+            'dist_to_latency_thresh': [-200, 100],  # Based on latencyThreshold bounds
+            'dist_to_cpu_thresh': [-30, 95],   # Based on cpuThreshold bounds  
+            'dist_to_prb_thresh': [-30, 95],   # Based on prbThreshold bounds
+            
+            # Efficiency metrics (new features)
+            'load_per_active_cell': [0, 5000/1],  # totalTraffic / 1 active cell
+            'power_efficiency': [0, 5000/100],     # totalTraffic / min power
+            
+            # Cell deltas (spatial)
+            'load_deltas': [-1000, 1000],      # Cell load deviation
+            'ue_deltas': [-50, 50],            # Cell UE deviation
+            
+            # Temporal deltas (time-series trends) - NEW
+            'drop_rate_delta': [-20, 20],     # Based on avgDropRate bounds
+            'latency_delta': [-200, 200],     # Based on avgLatency bounds  
+            'energy_delta': [-5000, 5000],    # Based on totalEnergy bounds
+            'active_cells_delta': [-50, 50],  # Based on activeCells bounds
         }
 
         def normalize(val, min_v, max_v):
             val = np.clip(val, min_v, max_v)
             return (val - min_v) / (max_v - min_v + 1e-8)
-
-        global_features = raw_new_features[:9]
-        load_deltas = raw_new_features[9 : 9 + self.n_cells]
-        ue_deltas = raw_new_features[9 + self.n_cells :]
 
         norm_global = np.array([
             normalize(global_features[0], *bounds['ue_density']),
@@ -157,16 +172,25 @@ class RLAgent:
         
         norm_load_deltas = normalize(load_deltas, *bounds['load_deltas'])
         norm_ue_deltas = normalize(ue_deltas, *bounds['ue_deltas'])
+        
+        norm_delta_features = np.array([
+            normalize(delta_features[0], *bounds['drop_rate_delta']),
+            normalize(delta_features[1], *bounds['latency_delta']),
+            normalize(delta_features[2], *bounds['energy_delta']), 
+            normalize(delta_features[3], *bounds['active_cells_delta'])
+        ])
 
-        return norm_global, norm_load_deltas, norm_ue_deltas
+        return norm_global, norm_load_deltas, norm_ue_deltas, norm_delta_features
     
-    def augment_state(self, current_state_raw, normalized_padded_state):
+    def augment_state(self, current_state_raw, normalized_padded_state, env_id=0, prev_state_raw=None):
         """
         Create new features from raw state to provide context and objectives for the agent.
         
         Args:
             current_state_raw (np.ndarray): Raw state vector, not normalized, not padded.
             normalized_padded_state (np.ndarray): Normalized and padded state vector.
+            env_id (int): Environment ID for tracking previous state
+            prev_state_raw (np.ndarray): Previous raw state for delta computation
 
         Returns:
             np.ndarray: Augmented state vector
@@ -228,19 +252,47 @@ class RLAgent:
         # Local correlation features (Hotspot/Coldspot)
         load_deltas = all_cell_loads - avg_cell_load
         ue_deltas = all_cell_ues - avg_cell_ues
+        
+        # Temporal delta features (trends) - substitute for GRU memory
+        current_energy = current_state_raw[NETWORK_START_IDX + 0]
+        if prev_state_raw is not None:
+            prev_drop_rate = prev_state_raw[NETWORK_START_IDX + 2]
+            prev_latency = prev_state_raw[NETWORK_START_IDX + 3]
+            prev_energy = prev_state_raw[NETWORK_START_IDX + 0]
+            prev_active_cells = prev_state_raw[NETWORK_START_IDX + 1]
+            
+            drop_rate_delta = current_drop_rate - prev_drop_rate
+            latency_delta = current_latency - prev_latency
+            energy_delta = current_energy - prev_energy
+            active_cells_delta = active_cells - prev_active_cells
+        else:
+            # First step, no deltas
+            drop_rate_delta = 0.0
+            latency_delta = 0.0
+            energy_delta = 0.0
+            active_cells_delta = 0.0
 
-        new_features = np.concatenate([
-            np.array([
+        delta_features = np.array([drop_rate_delta, latency_delta, energy_delta, active_cells_delta])
+
+        global_features = np.array([
             ue_density, isd, base_power, 
             dist_to_drop_thresh, dist_to_latency_thresh, dist_to_cpu_thresh, dist_to_prb_thresh,
             load_per_active_cell, power_efficiency
-            ]), 
-            load_deltas, 
-            ue_deltas
-        ])
+            ]) 
+        delta_features = np.array([drop_rate_delta, latency_delta, energy_delta, active_cells_delta])
+        load_deltas = np.array(load_deltas)
+        ue_deltas = np.array(ue_deltas)
+        
         
         # normalize new features
-        norm_global, norm_load_deltas, norm_ue_deltas = self.normalize_augmented_features(new_features)
+        (norm_global, 
+         norm_load_deltas, 
+         norm_ue_deltas,
+         norm_delta_features) = self.normalize_augmented_features(global_features, 
+                                                                  load_deltas, 
+                                                                  ue_deltas, 
+                                                                  delta_features)
+        
         # padding load_deltas and ue_deltas to max_cells length
         padded_deltas = np.zeros(self.max_cells - self.n_cells)
         norm_load_deltas = np.concatenate([norm_load_deltas, padded_deltas])
@@ -251,6 +303,7 @@ class RLAgent:
         augmented_state = np.concatenate([
             normalized_padded_state,
             norm_global,
+            norm_delta_features,  # Temporal info
             norm_load_deltas,
             norm_ue_deltas
         ])
@@ -361,12 +414,11 @@ class RLAgent:
         self.episodic_metrics['total_energy_consumption'] = 0.0
         self.episodic_metrics['energy_consumption_penalty'] = 0.0
         
-        # Reset hidden states for all envs
+        # Reset per-env states
         for i in range(self.n_envs):
-            self.actor_hidden_states[i] = None
-            self.critic_hidden_states[i] = None
             self.current_padded_actions[i] = np.ones(self.max_cells) * 0.7
             self.last_log_probs[i] = np.zeros(1)
+            self.prev_states[i] = None  # Reset delta tracking
 
     
     def end_episode(self):
@@ -404,14 +456,14 @@ class RLAgent:
         raw_state = np.array(state).flatten()   
         normalized_state = self.normalize_state(raw_state)
         normalized_padded_state = self.pad_state(normalized_state)
-        state = self.augment_state(raw_state, normalized_padded_state)
+        # Use prev_state to compute deltas (DON'T update yet, wait for update())
+        state = self.augment_state(raw_state, normalized_padded_state, env_id, self.prev_states[env_id])
                 
         state_tensor = torch.FloatTensor(state).unsqueeze(0).unsqueeze(0).to(self.device)
         
         with torch.no_grad():
-            
-            action_mean, action_logstd, next_actor_hidden = self.actor(state_tensor, self.actor_hidden_states[env_id])
-            self.actor_hidden_states[env_id] = next_actor_hidden
+            # Stateless: always pass None to reset GRU state
+            action_mean, action_logstd, _ = self.actor(state_tensor, None)
             
             if self.training_mode:
                 # Sample from policy during training
@@ -624,17 +676,21 @@ class RLAgent:
         raw_state = np.array(state).copy().flatten()
         normalized_state = self.normalize_state(raw_state)
         normalized_padded_state = self.pad_state(normalized_state)
-        state = self.augment_state(raw_state, normalized_padded_state)
+        # Use prev_state to compute deltas (same as in get_action)
+        prev_state_for_deltas = self.prev_states[env_id]
+        state = self.augment_state(raw_state, normalized_padded_state, env_id, prev_state_for_deltas)
         action = np.array(padded_action).flatten()
+        
+        # Update prev_state for next step (AFTER using it for deltas)
+        self.prev_states[env_id] = raw_state.copy()
         
         # Get value estimates
         state_tensor = torch.FloatTensor(state).unsqueeze(0).unsqueeze(0).to(self.device)
         
         with torch.no_grad():
-            value_tensor, next_critic_hidden = self.critic(state_tensor, self.critic_hidden_states[env_id])
+            # Stateless: always pass None to reset GRU state
+            value_tensor, _ = self.critic(state_tensor, None)
             value = value_tensor.item()
-            
-            self.critic_hidden_states[env_id] = next_critic_hidden
         
         # Create transition
         transition = Transition(
@@ -695,10 +751,11 @@ class RLAgent:
             env_dones = dones_tensor[env_mask]
             
             # Tính next_value cho transition cuối của env này
+            # Stateless: pass None như khi collection
             last_idx = env_indices[-1]
             last_state = torch.FloatTensor(states[last_idx]).unsqueeze(0).unsqueeze(0).to(self.device)
             with torch.no_grad():
-                next_value, _ = self.critic(last_state, None)  # No hidden state for last value
+                next_value, _ = self.critic(last_state, None)
                 next_value = next_value.squeeze()
             
             # Tính GAE cho env này
@@ -727,7 +784,7 @@ class RLAgent:
         else:
             advantages_tensor = advantages_tensor - advantages_tensor.mean()
 
-        # 4. PPO training loop
+        # 4. PPO training loop - STATELESS (shuffle, mini-batch)
         dataset = torch.utils.data.TensorDataset(states_tensor, actions_tensor, old_log_probs_tensor, advantages_tensor, returns_tensor)
         loader = torch.utils.data.DataLoader(dataset, batch_size=self.batch_size, shuffle=True)
 
@@ -736,11 +793,14 @@ class RLAgent:
             epoch_critic_losses = []
             
             for batch_states, batch_actions, batch_old_log_probs, batch_advantages, batch_returns in loader:          
-                action_mean, action_logstd, _ = self.actor(batch_states.unsqueeze(1)) # Unsqueeze to create seq_len=1
+                # Stateless: seq_len=1, hidden=None
+                action_mean, action_logstd, _ = self.actor(batch_states.unsqueeze(1), None)
+                action_mean = action_mean.squeeze(1)  # (batch_size, action_dim)
+                action_logstd = action_logstd.squeeze(1)
                 action_logstd = torch.clamp(action_logstd, min=-20.0, max=2.0)
                 dist = torch.distributions.Normal(action_mean, torch.exp(action_logstd))       
 
-                log_probs_all = dist.log_prob(batch_actions)   # (B, action_dim)
+                log_probs_all = dist.log_prob(batch_actions)   # (batch_size, action_dim)
 
                 # build mask and average
                 mask = torch.zeros_like(log_probs_all)
@@ -756,8 +816,9 @@ class RLAgent:
                 surr2 = torch.clamp(ratio, 1 - self.clip_epsilon, 1 + self.clip_epsilon) * batch_advantages
                 actor_loss = -torch.min(surr1, surr2).mean()
                 
-                current_values, _ = self.critic(batch_states.unsqueeze(1))
-                current_values = current_values.squeeze(-1)
+                # Stateless: seq_len=1, hidden=None
+                current_values, _ = self.critic(batch_states.unsqueeze(1), None)
+                current_values = current_values.squeeze(1).squeeze(-1)  # (batch_size,)
                 
                 critic_loss = nn.MSELoss()(current_values, batch_returns)
                 
