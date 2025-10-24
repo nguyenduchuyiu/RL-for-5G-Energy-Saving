@@ -17,12 +17,12 @@ from .metrics import compute_energy_saving_metrics, create_rl_state
 class FiveGEnvironment:
     """5G Network simulation environment (compatible with RL agents)"""
     
-    def __init__(self, scenario: str = 'indoor_hotspot', seed: int = 42):
+    def __init__(self, scenario: str = 'indoor_hotspot', seed: int = 42, scenarios_dir: str = None):
         self.scenario_name = scenario
         self.seed_value = seed
         
         # Load scenario configuration
-        self.sim_params = load_scenario_config(scenario)
+        self.sim_params = load_scenario_config(scenario, scenarios_dir=scenarios_dir)
         
         # Initialize network components
         self.sites: List[Site] = []
@@ -161,21 +161,24 @@ class FiveGEnvironment:
             metrics['instantaneous_power'] = total_power
             self.energy_metrics_history.append(metrics)
             
-            # Log
-            print(f'Step {self.current_step}/{self.sim_params.total_steps}: '
-                  f'Energy: {self.cumulative_energy:.3f} kWh, '
-                  f'Power: {total_power/1000:.1f} kW, '
-                  f'Drop Rate: {metrics["avg_drop_rate"]:.2f}%')
+            # Log only every 50 steps to reduce I/O overhead
+            if self.current_step % 50 == 0:
+                print(f'Step {self.current_step}/{self.sim_params.total_steps}: '
+                      f'Energy: {self.cumulative_energy:.3f} kWh, '
+                      f'Power: {total_power/1000:.1f} kW, '
+                      f'Drop Rate: {metrics["avg_drop_rate"]:.2f}%')
             
-            # Check KPI violations
+            # Check KPI violations (but don't print every time)
             if metrics['avg_drop_rate'] > self.sim_params.drop_call_threshold:
-                print(f'Drop rate violation: {metrics["avg_drop_rate"]:.2f}% > '
-                      f'{self.sim_params.drop_call_threshold}%')
+                if self.current_step % 50 == 0:
+                    print(f'Drop rate violation: {metrics["avg_drop_rate"]:.2f}% > '
+                          f'{self.sim_params.drop_call_threshold}%')
                 self.kpi_violations += 1
             
             if metrics['avg_latency'] > self.sim_params.latency_threshold:
-                print(f'Latency violation: {metrics["avg_latency"]:.1f} ms > '
-                      f'{self.sim_params.latency_threshold} ms')
+                if self.current_step % 50 == 0:
+                    print(f'Latency violation: {metrics["avg_latency"]:.1f} ms > '
+                          f'{self.sim_params.latency_threshold} ms')
                 self.kpi_violations += 1
         
         # Get next state
@@ -257,4 +260,3 @@ def run_simulation(scenario: str = 'indoor_hotspot', seed: int = 42) -> Dict[str
         obs, reward, done, truncated, info = env.step(action)
     
     return env.get_results()
-

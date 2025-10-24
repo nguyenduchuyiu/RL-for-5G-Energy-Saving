@@ -13,7 +13,7 @@
   "antennaHeight": 25,
   "cellRadius": 200,
   
-  "numUEs": 200,
+  "numUEs": 300,
   "userDistribution": "Uniform/macro",
   "ueSpeed": 3,
   "indoorRatio": 0.8,
@@ -24,7 +24,7 @@
   "basePower": 1000,
   "idlePower": 250,
   
-  "simTime": 10000,
+  "simTime": 4096,
   "timeStep": 1,
   
   "rsrpServingThreshold": -110,

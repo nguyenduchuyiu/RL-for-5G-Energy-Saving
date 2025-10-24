@@ -75,12 +75,15 @@ class RLAgent:
         self.violation_event_penalty = config['violation_event_penalty']
         self.cpu_magnitude_penalty_coef = config['cpu_magnitude_penalty_coef']
         self.prb_magnitude_penalty_coef = config['prb_magnitude_penalty_coef']
+        self.energy_consumption_penalty = config['energy_consumption_penalty']
+        self.entropy_coef = config.get('entropy_coef', 0.001)
         self.training_mode = config['training_mode']
         self.checkpoint_path = config['checkpoint_path']
+        self.chunk_len = config['chunk_len']
         # Experience buffer
         self.buffer = TrajectoryBuffer()
         
-        self.step_per_episode = config['step_per_episode']
+        self.step_per_episode = config['buffer_size']
         self.total_episodes = int(self.max_time / self.step_per_episode)
         self.current_episode = 1
         
@@ -88,14 +91,13 @@ class RLAgent:
         self.last_padded_action = self.current_padded_action
         self.last_padded_action = np.zeros(self.action_dim)
         self.last_log_prob = np.zeros(1)
-        self.current_step = 0
         
         # Metrics tracking
         self.metrics = {'drop_rate': [], 'latency': [], 'energy_efficiency_reward': [], 'drop_penalty': [], 
                        'latency_penalty': [], 'cpu_penalty': [], 'prb_penalty': [], 'drop_improvement': [], 
-                       'latency_improvement': [], 'total_reward': [], 'actor_loss': [], 'critic_loss': []}
+                       'latency_improvement': [], 'total_reward': [], 'actor_loss': [], 'critic_loss': [], 'entropy': []}
         
-        self.episodic_metrics = {'total_energy_consumption': 0.0, 'total_reward': 0.0, 
+        self.episodic_metrics = {'total_reward': 0.0, 
                                  'drop_penalty': 0.0, 'latency_penalty': 0.0, 
                                  'cpu_penalty': 0.0, 'prb_penalty': 0.0, 'drop_improvement': 0.0, 
                                  'latency_improvement': 0.0, 'energy_consumption_penalty': 0.0, 'energy_efficiency_reward': 0.0}
@@ -133,7 +135,7 @@ class RLAgent:
             'power_efficiency': [0, 1000],
             'load_deltas': [-500, 500],
             'ue_deltas': [-50, 50],
-            'total_energy_consumption': [0, 10000],
+            'energy_consumption': [0, 0.01],
         }
 
         def normalize(val, min_v, max_v):
@@ -154,7 +156,7 @@ class RLAgent:
             normalize(global_features[6], *bounds['dist_to_prb_thresh']),
             normalize(global_features[7], *bounds['load_per_active_cell']),
             normalize(global_features[8], *bounds['power_efficiency']),
-            normalize(global_features[9], *bounds['total_energy_consumption']),
+            normalize(global_features[9], *bounds['energy_consumption']),
         ])
         
         norm_load_deltas = normalize(load_deltas, *bounds['load_deltas'])
@@ -227,8 +229,11 @@ class RLAgent:
         # Load-Power efficiency: how much traffic is served per Watt of transmit power
         power_efficiency = total_traffic / (total_tx_power + 1e-6)
         
-        # total energy consumption
-        total_energy_consumption = self.episodic_metrics['total_energy_consumption']
+        # Energy consumption
+        # Convert power (W) to energy (kWh)
+        time_step = current_state_raw[3]  # seconds
+        current_energy = current_state_raw[NETWORK_START_IDX + 0]
+        energy_consumption = (current_energy / 1000) * (time_step / 3600)
         
         # Local correlation features (Hotspot/Coldspot)
         load_deltas = all_cell_loads - avg_cell_load
@@ -238,7 +243,7 @@ class RLAgent:
             np.array([
             ue_density, isd, base_power, 
             dist_to_drop_thresh, dist_to_latency_thresh, dist_to_cpu_thresh, dist_to_prb_thresh,
-            load_per_active_cell, power_efficiency, total_energy_consumption
+            load_per_active_cell, power_efficiency, energy_consumption
             ]), 
             load_deltas, 
             ue_deltas
@@ -362,7 +367,6 @@ class RLAgent:
         self.episodic_metrics['drop_improvement'] = 0.0
         self.episodic_metrics['latency_improvement'] = 0.0
         self.episodic_metrics['energy_efficiency_reward'] = 0.0
-        self.episodic_metrics['total_energy_consumption'] = 0.0
         self.episodic_metrics['energy_consumption_penalty'] = 0.0
         
         self.actor_hidden_state = None
@@ -374,21 +378,20 @@ class RLAgent:
     
     def end_episode(self):
         self.logger.info(f"Episode ={self.current_episode},\n"
-                         f"Episode Reward={self.episodic_metrics['total_reward']:.2f},\n"
-                         f"Drop Penalty={self.episodic_metrics['drop_penalty']:.2f},\n"
-                         f"Latency Penalty={self.episodic_metrics['latency_penalty']:.2f},\n"
-                         f"CPU Penalty={self.episodic_metrics['cpu_penalty']:.2f},\n"
-                         f"PRB Penalty={self.episodic_metrics['prb_penalty']:.2f},\n"
-                         f"Drop Improvement={self.episodic_metrics['drop_improvement']:.2f},\n"
-                         f"Latency Improvement={self.episodic_metrics['latency_improvement']:.2f},\n"
-                         f"Energy Efficiency Reward={self.episodic_metrics['energy_efficiency_reward']:.2f},\n"
-                         f"Total Energy Consumption={self.episodic_metrics['total_energy_consumption']:.2f},\n"
-                         f"Energy Consumption Penalty={self.episodic_metrics['energy_consumption_penalty']:.2f},\n"
+                         f"Episode Reward={self.episodic_metrics['total_reward'] / self.buffer_size :.2f},\n"
+                         f"Drop Penalty={self.episodic_metrics['drop_penalty'] / self.buffer_size:.2f},\n"
+                         f"Latency Penalty={self.episodic_metrics['latency_penalty'] / self.buffer_size:.2f},\n"
+                         f"CPU Penalty={self.episodic_metrics['cpu_penalty'] / self.buffer_size:.2f},\n"
+                         f"PRB Penalty={self.episodic_metrics['prb_penalty'] / self.buffer_size:.2f},\n"
+                         f"Drop Improvement={self.episodic_metrics['drop_improvement'] / self.buffer_size:.2f},\n"
+                         f"Latency Improvement={self.episodic_metrics['latency_improvement'] / self.buffer_size:.2f},\n"
+                         f"Energy Efficiency Reward={self.episodic_metrics['energy_efficiency_reward'] / self.buffer_size:.2f},\n"
+                         f"Energy Consumption Penalty={self.episodic_metrics['energy_consumption_penalty'] / self.buffer_size:.2f},\n"
         )        
         self.train()
         self.current_episode += 1
         
-        if self.current_episode <= self.total_episodes:
+        if self.current_episode < self.total_episodes:
             self.start_episode()
     
     # NOT REMOVED FOR INTERACTING WITH SIMULATION (CAN BE MODIFIED)
@@ -500,11 +503,8 @@ class RLAgent:
         
         # Convert power (W) to energy (kWh)
         time_step = current_state[3]  # seconds
-        energy_kwh = (current_energy / 1000) * (time_step / 3600)
-        
-        self.episodic_metrics['total_energy_consumption'] += energy_kwh
-
-        energy_consumption_penalty = config['energy_consumption_penalty'] * self.episodic_metrics['total_energy_consumption']
+        energy_consumption = (current_energy / 1000) * (time_step / 3600)
+        energy_consumption_penalty = self.energy_consumption_penalty * energy_consumption
 
         # --- Penalty for Drop Rate (Combined) ---
         drop_penalty, latency_penalty, cpu_penalty, prb_penalty = 0.0, 0.0, 0.0, 0.0
@@ -525,9 +525,35 @@ class RLAgent:
             excess = max_prb_usage - prb_threshold
             prb_penalty = self.violation_event_penalty - self.prb_magnitude_penalty_coef * (excess**2)
 
-        # --- Reward for Improvement (Always) ---
-        drop_improvement = self.improvement_coeff * (prev_drop_rate - current_drop_rate)
-        latency_improvement = self.improvement_coeff * (prev_latency - current_latency) * 0.1
+        # --- Reward for Improvement (MODIFIED V2) ---
+
+        # 1. Define "Safe Zones" (e.g., 80% or 90% of the threshold)
+        safe_drop_threshold = drop_threshold * 0.9
+        safe_latency_threshold = latency_threshold * 0.9
+
+        # 2. Calculate improvement value as before
+        drop_improvement_val = prev_drop_rate - current_drop_rate
+        latency_improvement_val = (prev_latency - current_latency) * 0.1
+        
+        drop_improvement = 0.0
+        latency_improvement = 0.0
+
+        # 3. LOGIC MỚI: Chỉ tính 'improvement' (thưởng hoặc phạt)
+        #    nếu state (trước hoặc sau) nằm ngoài vùng an toàn.
+        
+        if (prev_drop_rate > safe_drop_threshold) or (current_drop_rate > safe_drop_threshold):
+            # Nếu state trước (prev) KHÔNG an toàn, HOẶC state hiện tại (current) KHÔNG an toàn
+            # thì chúng ta mới "quan tâm" đến việc di chuyển (improvement/degradation).
+            drop_improvement = self.improvement_coeff * drop_improvement_val
+        
+        # Ngược lại (else):
+        # Nếu cả prev_drop_rate VÀ current_drop_rate đều NẰM TRONG vùng an toàn
+        # (ví dụ: 0.5% và 0.8%, đều < 0.9%)
+        # thì drop_improvement = 0.0.
+        # Agent sẽ không bị phạt khi đi từ 0.5% -> 0.8%.
+        
+        if (prev_latency > safe_latency_threshold) or (current_latency > safe_latency_threshold):
+            latency_improvement = self.improvement_coeff * latency_improvement_val
 
         # --- Total Reward ---
         total_reward = (
@@ -541,7 +567,7 @@ class RLAgent:
             + energy_consumption_penalty
         )
         
-        # Update episodic metrics
+        # Update episodic metrics (accumulated from all envs)
         self.episodic_metrics['total_reward'] += total_reward
         self.episodic_metrics['drop_penalty'] += drop_penalty
         self.episodic_metrics['latency_penalty'] += latency_penalty
@@ -552,8 +578,6 @@ class RLAgent:
         self.episodic_metrics['energy_consumption_penalty'] += energy_consumption_penalty
         self.episodic_metrics['energy_efficiency_reward'] += energy_efficiency_reward
         
-        
-        # Track metrics
         self.metrics['drop_rate'].append(current_drop_rate)
         self.metrics['latency'].append(current_latency)
         self.metrics['energy_efficiency_reward'].append(energy_efficiency_reward)
@@ -625,9 +649,7 @@ class RLAgent:
         # update last padded action
         self.last_padded_action = self.current_padded_action
         
-        self.current_step += 1
-        
-        if self.current_step % self.step_per_episode == 0 and self.training_mode:
+        if len(self.buffer) >= self.buffer_size and self.training_mode:
             self.end_episode()
             
     
@@ -648,95 +670,183 @@ class RLAgent:
             return advantages, returns
     
     def train(self):
-        # SỬA ĐỔI: Lấy dữ liệu từ buffer mới
+        # Sequence-aware PPO training (chunked TBPTT) for GRU actor/critic
         states, actions, rewards, dones, old_log_probs, values = self.buffer.get_all_and_clear()
-        # Tính next_value cho transition cuối cùng trong batch
+
+        if len(states) == 0:
+            return
+
+        # Bootstrap value for the last state (decoupled from online hidden state)
         last_state = torch.FloatTensor(states[-1]).unsqueeze(0).unsqueeze(0).to(self.device)
         with torch.no_grad():
-            next_value, _ = self.critic(last_state, self.critic_hidden_state)
+            next_value, _ = self.critic(last_state, None)
             next_value = next_value.squeeze()
 
-        # Chuyển dữ liệu sang tensor
+        # Tensors for GAE
         rewards_tensor = torch.FloatTensor(rewards).to(self.device)
         values_tensor = torch.FloatTensor(values).to(self.device)
         dones_tensor = torch.FloatTensor(dones).to(self.device)
 
-        # Tính GAE
+        # Compute GAE over the collected trajectory(ies)
         advantages, returns = self.compute_gae_for_trajectory(rewards_tensor, values_tensor, dones_tensor, next_value)
-        
-        # Gộp dữ liệu thành batch lớn
-        states_tensor = torch.FloatTensor(states).to(self.device)
-        actions_tensor = torch.FloatTensor(actions).to(self.device)
-        old_log_probs_tensor = torch.FloatTensor(old_log_probs).to(self.device)
-        # advantages and returns are already tensors on the correct device
-        advantages_tensor = advantages
-        returns_tensor = returns
-        
-        # Normalize advantages
-        if len(advantages_tensor) > 1:
-            advantages_tensor = (advantages_tensor - advantages_tensor.mean()) / (advantages_tensor.std() + 1e-8)
+
+        # Move to numpy for chunking
+        states_np = np.asarray(states, dtype=np.float32)
+        actions_np = np.asarray(actions, dtype=np.float32)
+        oldlp_np = np.asarray(old_log_probs, dtype=np.float32)
+        adv_np = advantages.detach().cpu().numpy().astype(np.float32)
+        ret_np = returns.detach().cpu().numpy().astype(np.float32)
+        dones_np = np.asarray(dones, dtype=np.float32)
+
+        # Normalize advantages globally
+        if len(adv_np) > 1:
+            adv_np = (adv_np - adv_np.mean()) / (adv_np.std() + 1e-8)
         else:
-            advantages_tensor = advantages_tensor - advantages_tensor.mean()
+            adv_np = adv_np - adv_np.mean()
 
-        # 4. PPO training loop
-        dataset = torch.utils.data.TensorDataset(states_tensor, actions_tensor, old_log_probs_tensor, advantages_tensor, returns_tensor)
-        loader = torch.utils.data.DataLoader(dataset, batch_size=self.batch_size, shuffle=True)
+        # Segment by episode boundaries using dones
+        traj_bounds = []
+        start_idx = 0
+        for t in range(len(states_np)):
+            is_last = (t == len(states_np) - 1)
+            if is_last or dones_np[t] > 0.5:
+                end_idx = t + 1
+                if end_idx - start_idx > 0:
+                    traj_bounds.append((start_idx, end_idx))
+                start_idx = end_idx
 
+        # Build fixed-length chunks (drop remainders)
+        CHUNK_LEN = min(self.chunk_len, len(states_np))
+        chunks = []  # list of tuples (states[L,D], actions[L,A], oldlp[L], adv[L], ret[L])
+        for (s_idx, e_idx) in traj_bounds:
+            seg_len = e_idx - s_idx
+            n_full = seg_len // CHUNK_LEN
+            for k in range(n_full):
+                a = s_idx + k * CHUNK_LEN
+                b = a + CHUNK_LEN
+                chunks.append((
+                    states_np[a:b],
+                    actions_np[a:b],
+                    oldlp_np[a:b],
+                    adv_np[a:b],
+                    ret_np[a:b],
+                ))
+
+        if not chunks:
+            return
+
+        rng = np.random.default_rng()
+
+        avg_actor_loss, avg_critic_loss = 0.0, 0.0
         for epoch in range(self.ppo_epochs):
+            rng.shuffle(chunks)
             epoch_actor_losses = []
             epoch_critic_losses = []
-            
-            for batch_states, batch_actions, batch_old_log_probs, batch_advantages, batch_returns in loader:          
-                action_mean, action_logstd, _ = self.actor(batch_states.unsqueeze(1)) # Unsqueeze to create seq_len=1
-                action_logstd = torch.clamp(action_logstd, min=-20.0, max=2.0)
-                dist = torch.distributions.Normal(action_mean, torch.exp(action_logstd))       
 
-                log_probs_all = dist.log_prob(batch_actions)   # (B, action_dim)
+            # Number of chunks per minibatch equals PPO minibatch size (counted by chunks)
+            chunks_per_batch = max(1, int(self.batch_size))
+            for i in range(0, len(chunks), chunks_per_batch):
+                batch = chunks[i:i + chunks_per_batch]
 
-                # build mask and average
-                mask = torch.zeros_like(log_probs_all)
-                mask[:, :self.n_cells] = 1.0
-                active_counts = mask.sum(dim=-1).clamp(min=1.0)
-                new_log_probs = (log_probs_all * mask).sum(dim=-1) / active_counts
+                # Stack to tensors: (B, L, ...)
+                bs = torch.FloatTensor(np.stack([c[0] for c in batch], axis=0)).to(self.device)
+                ba = torch.FloatTensor(np.stack([c[1] for c in batch], axis=0)).to(self.device)
+                bolp = torch.FloatTensor(np.stack([c[2] for c in batch], axis=0)).to(self.device)
+                badv = torch.FloatTensor(np.stack([c[3] for c in batch], axis=0)).to(self.device)
+                bret = torch.FloatTensor(np.stack([c[4] for c in batch], axis=0)).to(self.device)
 
-                log_ratio = new_log_probs - batch_old_log_probs
+                seq_len = bs.size(1)
+                # Explicitly reshape PPO tensors to (B, L)
+                bolp = bolp.view(bs.size(0), seq_len)
+                badv = badv.view(bs.size(0), seq_len)
+                bret = bret.view(bs.size(0), seq_len)
+
+                # Actor forward through time to get per-timestep log-probs
+                hidden_actor = None
+                step_log_probs = []  # list of (B,)
+                step_entropies = []  # list of (B,)
+                for t in range(seq_len):
+                    inp_t = bs[:, t:t+1, :]
+                    mean_t, logstd_t, hidden_actor = self.actor(inp_t, hidden_actor)
+                    if isinstance(hidden_actor, tuple):
+                        hidden_actor = tuple(h.detach() for h in hidden_actor)
+                    else:
+                        hidden_actor = hidden_actor.detach()
+                    logstd_t = torch.clamp(logstd_t, min=-20.0, max=2.0)
+                    dist_t = torch.distributions.Normal(mean_t, torch.exp(logstd_t))
+
+                    log_probs_all_t = dist_t.log_prob(ba[:, t, :])  # (B, action_dim)
+                    mask = torch.zeros_like(log_probs_all_t)
+                    mask[:, :self.n_cells] = 1.0
+                    active_counts = mask.sum(dim=-1).clamp(min=1.0)
+                    avg_log_prob_t = (log_probs_all_t * mask).sum(dim=-1) / active_counts  # (B,)
+                    step_log_probs.append(avg_log_prob_t)
+
+                    entropy_all_t = dist_t.entropy()  # (B, action_dim)
+                    avg_entropy_t = (entropy_all_t * mask).sum(dim=-1) / active_counts  # (B,)
+                    step_entropies.append(avg_entropy_t)
+
+                new_log_probs = torch.stack(step_log_probs, dim=1)  # (B, L)
+                entropy = torch.stack(step_entropies, dim=1)  # (B, L)
+                # Track mean entropy for monitoring
+                self.metrics['entropy'].append(float(entropy.mean().detach().cpu().item()))
+
+                # Ensure shapes match for PPO terms
+                bolp = bolp.view_as(new_log_probs)
+                badv = badv.view_as(new_log_probs)
+                
+                log_ratio = new_log_probs - bolp
                 log_ratio = torch.clamp(log_ratio, min=-10.0, max=10.0)
                 ratio = torch.exp(log_ratio)
-                
-                surr1 = ratio * batch_advantages
-                surr2 = torch.clamp(ratio, 1 - self.clip_epsilon, 1 + self.clip_epsilon) * batch_advantages
+
+                surr1 = ratio * badv
+                surr2 = torch.clamp(ratio, 1 - self.clip_epsilon, 1 + self.clip_epsilon) * badv
                 actor_loss = -torch.min(surr1, surr2).mean()
-                
-                current_values, _ = self.critic(batch_states.unsqueeze(1))
-                current_values = current_values.squeeze(-1)
-                
-                critic_loss = nn.MSELoss()(current_values, batch_returns)
-                
+                actor_loss = actor_loss - self.entropy_coef * entropy.mean()
+
+                # Critic forward through time to get per-timestep values
+                hidden_critic = None
+                value_steps = []
+                for t in range(seq_len):
+                    inp_t = bs[:, t:t+1, :]
+                    value_t, hidden_critic = self.critic(inp_t, hidden_critic)
+                    value_steps.append(value_t.squeeze(-1))  # (B,)
+                values_pred = torch.stack(value_steps, dim=1)  # (B, L)
+
+                critic_loss = 0.5 * nn.MSELoss()(values_pred, bret)
+
                 # Update actor
                 self.actor_optimizer.zero_grad()
                 actor_loss.backward()
                 torch.nn.utils.clip_grad_norm_(self.actor.parameters(), 0.5)
                 self.actor_optimizer.step()
-                
+                # Detach/reset hidden states after each minibatch update
+                if isinstance(hidden_actor, tuple):
+                    hidden_actor = tuple(h.detach() for h in hidden_actor)
+                elif hidden_actor is not None:
+                    hidden_actor = hidden_actor.detach()
+
                 # Update critic
                 self.critic_optimizer.zero_grad()
                 critic_loss.backward()
                 torch.nn.utils.clip_grad_norm_(self.critic.parameters(), 0.5)
                 self.critic_optimizer.step()
-                
+                if isinstance(hidden_critic, tuple):
+                    hidden_critic = tuple(h.detach() for h in hidden_critic)
+                elif hidden_critic is not None:
+                    hidden_critic = hidden_critic.detach()
+
                 epoch_actor_losses.append(actor_loss.item())
                 epoch_critic_losses.append(critic_loss.item())
-            
-            avg_actor_loss = np.mean(epoch_actor_losses)
-            avg_critic_loss = np.mean(epoch_critic_losses)
+
+            avg_actor_loss = float(np.mean(epoch_actor_losses)) if epoch_actor_losses else 0.0
+            avg_critic_loss = float(np.mean(epoch_critic_losses)) if epoch_critic_losses else 0.0
             self.logger.info(f"Epoch {epoch+1}/{self.ppo_epochs}: Actor loss={avg_actor_loss:.4f}, Critic loss={avg_critic_loss:.4f}")
-        
+
         # Track losses
         self.metrics['actor_loss'].append(avg_actor_loss)
         self.metrics['critic_loss'].append(avg_critic_loss)
-                
-        self.logger.info(f"Training completed: Actor loss={actor_loss:.4f}, "
-                        f"Critic loss={critic_loss:.4f}")
+        self.logger.info(f"Training completed: Actor loss={avg_actor_loss:.4f}, Critic loss={avg_critic_loss:.4f}")
     
     def save_model(self, filepath=None):
         """Save model parameters"""
@@ -763,9 +873,6 @@ class RLAgent:
         self.actor_optimizer.load_state_dict(checkpoint['actor_optimizer_state_dict'])
         self.critic_optimizer.load_state_dict(checkpoint['critic_optimizer_state_dict'])
         
-        self.total_episodes = checkpoint.get('total_episodes', 0)
-        self.total_steps = checkpoint.get('total_steps', 0)
-        
         self.logger.info(f"Model loaded from {filepath}")
     
     def set_training_mode(self, training):
@@ -787,17 +894,11 @@ class RLAgent:
         fig, axes = plt.subplots(2, 2, figsize=(12, 8))
         fig.suptitle(f'Episode {self.total_episodes} Metrics')
         
-        # QoS metrics
-        if self.metrics['drop_rate']:
-            axes[0,0].plot(self.metrics['drop_rate'], alpha=0.3, label='Drop Rate')
-            axes[0,0].plot(ma(self.metrics['drop_rate']), label='Drop Rate MA', linewidth=2)
-            axes[0,0].set_ylabel('Drop Rate'); axes[0,0].legend()
-        
-        if self.metrics['latency']:
-            ax2 = axes[0,0].twinx()
-            ax2.plot(self.metrics['latency'], 'orange', alpha=0.3, label='Latency')
-            ax2.plot(ma(self.metrics['latency']), 'orange', label='Latency MA', linewidth=2)
-            ax2.set_ylabel('Latency'); ax2.legend(loc='upper right')
+        # Entropy and Energy metrics
+        if self.metrics['entropy']:
+            axes[0,0].plot(self.metrics['entropy'], alpha=0.3, label='Entropy')
+            axes[0,0].plot(ma(self.metrics['entropy']), label='Entropy MA', linewidth=2)
+            axes[0,0].set_ylabel('Entropy'); axes[0,0].legend()
         
         # Reward components
         if self.metrics['energy_efficiency_reward']:
