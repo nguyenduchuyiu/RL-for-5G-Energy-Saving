@@ -617,16 +617,6 @@ class RLAgent:
             + energy_consumption_penalty
         )
         
-        print(f"Total reward: {total_reward}")
-        print(f"Energy efficiency reward: {energy_efficiency_reward}")
-        print(f"Drop penalty: {drop_penalty}")
-        print(f"Latency penalty: {latency_penalty}")
-        print(f"CPU penalty: {cpu_penalty}")
-        print(f"PRB penalty: {prb_penalty}")
-        print(f"Drop improvement: {drop_improvement}")
-        print(f"Latency improvement: {latency_improvement}")
-        print(f"Energy consumption penalty: {energy_consumption_penalty}")
-        
         # Update episodic metrics (accumulated from all envs)
         self.episodic_metrics['total_reward'] += total_reward
         self.episodic_metrics['drop_penalty'] += drop_penalty
