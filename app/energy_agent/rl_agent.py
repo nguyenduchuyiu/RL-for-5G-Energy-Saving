@@ -418,7 +418,6 @@ class RLAgent:
         for i in range(self.n_envs):
             self.current_padded_actions[i] = np.ones(self.max_cells) * 0.7
             self.last_log_probs[i] = np.zeros(1)
-            self.prev_states[i] = None  # Reset delta tracking
 
     
     def end_episode(self):
@@ -617,6 +616,16 @@ class RLAgent:
             + latency_improvement
             + energy_consumption_penalty
         )
+        
+        print(f"Total reward: {total_reward}")
+        print(f"Energy efficiency reward: {energy_efficiency_reward}")
+        print(f"Drop penalty: {drop_penalty}")
+        print(f"Latency penalty: {latency_penalty}")
+        print(f"CPU penalty: {cpu_penalty}")
+        print(f"PRB penalty: {prb_penalty}")
+        print(f"Drop improvement: {drop_improvement}")
+        print(f"Latency improvement: {latency_improvement}")
+        print(f"Energy consumption penalty: {energy_consumption_penalty}")
         
         # Update episodic metrics (accumulated from all envs)
         self.episodic_metrics['total_reward'] += total_reward
