@@ -80,7 +80,7 @@ def create_rl_state(cells: List[Cell], ues: List[UE], current_time: float, sim_p
         len(ues),  # totalUEs
         sim_params.sim_time,  # simTime
         sim_params.time_step,  # timeStep
-        current_time / sim_params.sim_time,  # timeProgress
+        current_time / max(sim_params.sim_time, 1.0),  # timeProgress (avoid division by zero)
         sim_params.carrier_frequency,  # carrierFrequency
         sim_params.isd,  # isd
         sim_params.min_tx_power,  # minTxPower

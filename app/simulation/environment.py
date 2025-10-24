@@ -260,3 +260,4 @@ def run_simulation(scenario: str = 'indoor_hotspot', seed: int = 42) -> Dict[str
         obs, reward, done, truncated, info = env.step(action)
     
     return env.get_results()
+

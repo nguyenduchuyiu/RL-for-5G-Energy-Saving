@@ -4,8 +4,6 @@ import json
 from pathlib import Path
 from typing import Dict, Any, Optional
 from dataclasses import dataclass, field
-import numpy as np
-
 
 
 @dataclass
@@ -232,4 +230,6 @@ def _validate_and_enhance_config(sim_params: SimParams) -> SimParams:
     
     return sim_params
 
+
+import numpy as np
 

@@ -202,7 +202,8 @@ def handle_disconnected_ues(ues: List[UE], cells: List[Cell], sim_params: SimPar
                         ue.disconnection_timer -= time_step
                         
                         if ue.disconnection_timer <= 0:
-                            print(f'UE {ue.id} disconnected from cell {ue.serving_cell} (RSRP: {ue.rsrp:.1f} dBm)')
+                            # Reduce logging to avoid I/O overhead
+                            # print(f'UE {ue.id} disconnected from cell {ue.serving_cell} (RSRP: {ue.rsrp:.1f} dBm)')
                             ue.serving_cell = None
                             ue.rsrp = None
                             ue.rsrq = None
