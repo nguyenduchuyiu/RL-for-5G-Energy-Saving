@@ -735,11 +735,8 @@ class RLAgent:
         if not chunks:
             return
 
-        rng = np.random.default_rng()
-
         avg_actor_loss, avg_critic_loss = 0.0, 0.0
         for epoch in range(self.ppo_epochs):
-            rng.shuffle(chunks)
             epoch_actor_losses = []
             epoch_critic_losses = []
 
@@ -768,10 +765,6 @@ class RLAgent:
                 for t in range(seq_len):
                     inp_t = bs[:, t:t+1, :]
                     mean_t, logstd_t, hidden_actor = self.actor(inp_t, hidden_actor)
-                    if isinstance(hidden_actor, tuple):
-                        hidden_actor = tuple(h.detach() for h in hidden_actor)
-                    else:
-                        hidden_actor = hidden_actor.detach()
                     logstd_t = torch.clamp(logstd_t, min=-20.0, max=2.0)
                     dist_t = torch.distributions.Normal(mean_t, torch.exp(logstd_t))
 
