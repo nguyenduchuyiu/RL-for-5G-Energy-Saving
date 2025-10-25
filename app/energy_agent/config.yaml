@@ -5,22 +5,25 @@ checkpoint_path: "app/energy_agent/models/ppo_rnn_model_last.pth"
 actor_lr: 0.0001
 critic_lr: 0.0003
 
-energy_coeff: 0.1
-drop_magnitude_penalty_coef: 1.0
-latency_magnitude_penalty_coef: 1.0
-cpu_magnitude_penalty_coef: 1.0
-prb_magnitude_penalty_coef: 1.0
-improvement_coeff: 5.0
-
-violation_event_penalty: -50.0
+qos_grad_coeff: 10.0
+energy_grad_coeff: 5.0
+cpu_grad_coeff: 1.0
+prb_grad_coeff: 1.0
+stability_penalty: 2.0
 energy_consumption_penalty: -1000.0
+# energy_coeff: 0.1
+# drop_magnitude_penalty_coef: 1.0
+# latency_magnitude_penalty_coef: 1.0
+# cpu_magnitude_penalty_coef: 1.0
+# prb_magnitude_penalty_coef: 1.0
+# improvement_coeff: 5.0
 
-entropy_coef: 0.001
+entropy_coef: 0.01
 gamma: 0.99
 lambda_gae: 0.95
 clip_epsilon: 0.2
 ppo_epochs: 8
-batch_size: 8
+batch_size: 4
 chunk_len: 32
 buffer_size: 512
 hidden_dim: 256
