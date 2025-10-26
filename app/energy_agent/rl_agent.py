@@ -39,8 +39,8 @@ class RLAgent:
         
         self.original_state_dim = 17 + 14 + (self.max_cells * 12)
         
-        # 9 global features + 4 delta features + 2*max_cells local features
-        self.state_dim = self.original_state_dim + 9 + 4 + 2*self.max_cells
+        # 9 global features + 5 delta features + 2*max_cells local features
+        self.state_dim = self.original_state_dim + 9 + 5 + 2*self.max_cells
         
         # Power ratio for each cell
         self.action_dim = self.max_cells
@@ -66,15 +66,6 @@ class RLAgent:
         
         self.actor_optimizer = optim.Adam(self.actor.parameters(), lr=config['actor_lr'])
         self.critic_optimizer = optim.Adam(self.critic.parameters(), lr=config['critic_lr'])
-                
-        # reward coefficients
-        self.energy_coeff = config['energy_coeff']
-        self.drop_magnitude_penalty_coef = config['drop_magnitude_penalty_coef']
-        self.latency_magnitude_penalty_coef = config['latency_magnitude_penalty_coef']
-        self.improvement_coeff = config['improvement_coeff']
-        self.violation_event_penalty = config['violation_event_penalty']
-        self.cpu_magnitude_penalty_coef = config['cpu_magnitude_penalty_coef']
-        self.prb_magnitude_penalty_coef = config['prb_magnitude_penalty_coef']
         self.training_mode = config['training_mode']
         self.checkpoint_path = config['checkpoint_path']
         # Experience buffer
@@ -92,14 +83,11 @@ class RLAgent:
         self.prev_states = {i: None for i in range(self.n_envs)}
         
         # Metrics tracking
-        self.metrics = {'drop_rate': [], 'latency': [], 'energy_efficiency_reward': [], 'drop_penalty': [], 
-                       'latency_penalty': [], 'cpu_penalty': [], 'prb_penalty': [], 'drop_improvement': [], 
-                       'latency_improvement': [], 'total_reward': [], 'actor_loss': [], 'critic_loss': []}
+        self.metrics = {'drop_rate': [], 'latency': [], 'cpu': [], 'prb': [], 'energy_efficiency_reward': [], 
+                       'drop_improvement': [], 'latency_improvement': [], 'cpu_improvement': [], 'prb_improvement': [],
+                       'stability_penalty': [], 'energy_consumption_penalty': [], 'total_reward': [], 
+                       'actor_loss': [], 'critic_loss': [], 'entropy': []}
         
-        self.episodic_metrics = {'total_energy_consumption': 0.0, 'total_reward': 0.0, 
-                                 'drop_penalty': 0.0, 'latency_penalty': 0.0, 
-                                 'cpu_penalty': 0.0, 'prb_penalty': 0.0, 'drop_improvement': 0.0, 
-                                 'latency_improvement': 0.0, 'energy_consumption_penalty': 0.0, 'energy_efficiency_reward': 0.0}
                 
         self.setup_logging(log_file)
         
@@ -113,9 +101,9 @@ class RLAgent:
         if os.path.exists(self.checkpoint_path):
             self.load_model(self.checkpoint_path)
             self.logger.info(f"Loaded checkpoint from {self.checkpoint_path}")
-            self.logger.info(f"Fine-tuning with learning rate 3e-5 for actor and 1e-4 for critic")
-            self.actor_optimizer.param_groups[0]['lr'] = 3e-5
-            self.critic_optimizer.param_groups[0]['lr'] = 1e-4
+            # self.logger.info(f"Fine-tuning with learning rate 3e-5 for actor and 1e-4 for critic")
+            # self.actor_optimizer.param_groups[0]['lr'] = 3e-5
+            # self.critic_optimizer.param_groups[0]['lr'] = 1e-4
         else:
             self.logger.info(f"No checkpoint found at {self.checkpoint_path}")
         
@@ -152,6 +140,7 @@ class RLAgent:
             'latency_delta': [-200, 200],     # Based on avgLatency bounds  
             'energy_delta': [-5000, 5000],    # Based on totalEnergy bounds
             'active_cells_delta': [-50, 50],  # Based on activeCells bounds
+            'energy_consumption_delta': [-1, 1],
         }
 
         def normalize(val, min_v, max_v):
@@ -177,12 +166,13 @@ class RLAgent:
             normalize(delta_features[0], *bounds['drop_rate_delta']),
             normalize(delta_features[1], *bounds['latency_delta']),
             normalize(delta_features[2], *bounds['energy_delta']), 
-            normalize(delta_features[3], *bounds['active_cells_delta'])
+            normalize(delta_features[3], *bounds['active_cells_delta']),
+            normalize(delta_features[4], *bounds['energy_consumption_delta'])
         ])
 
         return norm_global, norm_load_deltas, norm_ue_deltas, norm_delta_features
     
-    def augment_state(self, current_state_raw, normalized_padded_state, env_id=0, prev_state_raw=None):
+    def augment_state(self, current_state_raw, normalized_padded_state, prev_state_raw=None):
         """
         Create new features from raw state to provide context and objectives for the agent.
         
@@ -265,12 +255,18 @@ class RLAgent:
             latency_delta = current_latency - prev_latency
             energy_delta = current_energy - prev_energy
             active_cells_delta = active_cells - prev_active_cells
+            # Convert power (W) to energy (kWh)
+            time_step = current_state_raw[3]  # seconds
+            current_tx_power = current_state_raw[NETWORK_START_IDX + 12]
+            prev_tx_power = prev_state_raw[NETWORK_START_IDX + 12]
+            energy_consumption_delta = (current_tx_power - prev_tx_power) / 1000 * (time_step / 3600)
         else:
             # First step, no deltas
             drop_rate_delta = 0.0
             latency_delta = 0.0
             energy_delta = 0.0
             active_cells_delta = 0.0
+            energy_consumption_delta = 0.0
 
         delta_features = np.array([drop_rate_delta, latency_delta, energy_delta, active_cells_delta])
 
@@ -279,7 +275,7 @@ class RLAgent:
             dist_to_drop_thresh, dist_to_latency_thresh, dist_to_cpu_thresh, dist_to_prb_thresh,
             load_per_active_cell, power_efficiency
             ]) 
-        delta_features = np.array([drop_rate_delta, latency_delta, energy_delta, active_cells_delta])
+        delta_features = np.array([drop_rate_delta, latency_delta, energy_delta, active_cells_delta, energy_consumption_delta])
         load_deltas = np.array(load_deltas)
         ue_deltas = np.array(ue_deltas)
         
@@ -402,17 +398,8 @@ class RLAgent:
         self.save_model(self.checkpoint_path)
     
     def start_episode(self):
-        print(f"===================Starting episode: {self.current_episode}===================")
-        self.episodic_metrics['total_reward'] = 0.0
-        self.episodic_metrics['drop_penalty'] = 0.0
-        self.episodic_metrics['latency_penalty'] = 0.0
-        self.episodic_metrics['cpu_penalty'] = 0.0
-        self.episodic_metrics['prb_penalty'] = 0.0
-        self.episodic_metrics['drop_improvement'] = 0.0
-        self.episodic_metrics['latency_improvement'] = 0.0
-        self.episodic_metrics['energy_efficiency_reward'] = 0.0
-        self.episodic_metrics['total_energy_consumption'] = 0.0
-        self.episodic_metrics['energy_consumption_penalty'] = 0.0
+        print(f"Starting episode: {self.current_episode}")
+
         
         # Reset per-env states
         for i in range(self.n_envs):
@@ -421,19 +408,6 @@ class RLAgent:
 
     
     def end_episode(self):
-        print(f"=====================Ending episode: {self.current_episode}=====================")
-        self.logger.info(f"Episode ={self.current_episode},\n"
-                         f"Episode Reward={self.episodic_metrics['total_reward']/config['n_envs']:.2f},\n"
-                         f"Drop Penalty={self.episodic_metrics['drop_penalty']/config['n_envs']:.2f},\n"
-                         f"Latency Penalty={self.episodic_metrics['latency_penalty']/config['n_envs']:.2f},\n"
-                         f"CPU Penalty={self.episodic_metrics['cpu_penalty']/config['n_envs']:.2f},\n"
-                         f"PRB Penalty={self.episodic_metrics['prb_penalty']/config['n_envs']:.2f},\n"
-                         f"Drop Improvement={self.episodic_metrics['drop_improvement']/config['n_envs']:.2f},\n"
-                         f"Latency Improvement={self.episodic_metrics['latency_improvement']/config['n_envs']:.2f},\n"
-                         f"Energy Efficiency Reward={self.episodic_metrics['energy_efficiency_reward']/config['n_envs']:.2f},\n"
-                         f"Total Energy Consumption={self.episodic_metrics['total_energy_consumption']/config['n_envs']:.2f},\n"
-                         f"Energy Consumption Penalty={self.episodic_metrics['energy_consumption_penalty']/config['n_envs']:.2f},\n"
-        )        
         self.train()
         self.current_episode += 1
         if self.current_episode < self.total_episodes:
@@ -456,7 +430,7 @@ class RLAgent:
         normalized_state = self.normalize_state(raw_state)
         normalized_padded_state = self.pad_state(normalized_state)
         # Use prev_state to compute deltas (DON'T update yet, wait for update())
-        state = self.augment_state(raw_state, normalized_padded_state, env_id, self.prev_states[env_id])
+        state = self.augment_state(raw_state, normalized_padded_state, self.prev_states[env_id])
                 
         state_tensor = torch.FloatTensor(state).unsqueeze(0).unsqueeze(0).to(self.device)
         
@@ -495,153 +469,160 @@ class RLAgent:
         self.last_log_probs[env_id] = np.array([avg_log_prob])
         
         # return truncated action for environment
+        if not self.training_mode:
+            # In evaluation mode, update prev_states here (no update() call)
+            self.prev_states[env_id] = raw_state.copy()
         return truncated_action.cpu().numpy().flatten()
     
     ## OPTIONAL: Modify reward calculation as needed
     def calculate_reward(self, prev_state, action, current_state, env_id=0):
         """
-        Calculate reward based on energy efficiency and QoS constraints.
-        
-        Args:
-            prev_state: Previous state vector
-            action: Action taken (power ratios)
-            current_state: Current state vector
-            env_id: ID of the environment
-            
-        Returns:
-            float: Calculated reward value
+        Directional reward including CPU and PRB:
+        - Nếu bất kỳ QoS metric (drop, latency, cpu, prb) vượt safe -> thưởng gradient (giảm metric)
+        - Nếu tất cả QoS nằm trong safe -> thưởng tiết kiệm năng lượng, phạt nhẹ khi gần danger zone
+        - Không có phạt cứng cho violation; chỉ thưởng hướng cải thiện / phạt nhẹ hướng ra ngoài
         """
         if prev_state is None:
             return 0.0
 
         prev_state = np.array(prev_state).flatten()
         current_state = np.array(current_state).flatten()
+        action = np.array(action).flatten()
 
-        # State structure indices
+        # indices
         CELL_START_IDX = 17 + 14
         NETWORK_START_IDX = 17
-                
-        # Extract current and previous metrics
-        current_energy = current_state[NETWORK_START_IDX + 0]
-        prev_energy = prev_state[NETWORK_START_IDX + 0]
-        
-        current_drop_rate = current_state[NETWORK_START_IDX + 2]
-        prev_drop_rate = prev_state[NETWORK_START_IDX + 2]
-        
-        current_latency = current_state[NETWORK_START_IDX + 3]
-        prev_latency = prev_state[NETWORK_START_IDX + 3]
-
         CELL_FEATURE_COUNT = 12
+
+        # network-level
+        prev_energy = prev_state[NETWORK_START_IDX + 0]
+        current_energy = current_state[NETWORK_START_IDX + 0]
+
+        prev_drop = prev_state[NETWORK_START_IDX + 2]
+        current_drop = current_state[NETWORK_START_IDX + 2]
+
+        prev_latency = prev_state[NETWORK_START_IDX + 3]
+        current_latency = current_state[NETWORK_START_IDX + 3]
+
+        drop_th = current_state[11]
+        latency_th = current_state[12]
+        cpu_th = current_state[13]
+        prb_th = current_state[14]
+
+        # per-cell maxima (current & prev)
         CPU_FEATURE_IDX = CELL_START_IDX
         PRB_FEATURE_IDX = CELL_START_IDX + CELL_FEATURE_COUNT
-        max_cpu_usage = np.max(current_state[CPU_FEATURE_IDX:CPU_FEATURE_IDX + self.n_cells])
-        max_prb_usage = np.max(current_state[PRB_FEATURE_IDX:PRB_FEATURE_IDX + self.n_cells])
-        
-        # Extract thresholds from simulation features
-        drop_threshold = current_state[11]  # dropCallThreshold
-        latency_threshold = current_state[12]  # latencyThreshold
-        cpu_threshold = current_state[13]
-        prb_threshold = current_state[14]
-        
-        # --- Energy Reward ---
-        energy_efficiency = prev_energy - current_energy 
-        energy_efficiency_reward = self.energy_coeff * energy_efficiency
-        
-        # Convert power (W) to energy (kWh)
-        time_step = current_state[3]  # seconds
-        energy_kwh = (current_energy / 1000) * (time_step / 3600)
-        
-        self.episodic_metrics['total_energy_consumption'] += energy_kwh
+        max_cpu = np.max(current_state[CPU_FEATURE_IDX:CPU_FEATURE_IDX + self.n_cells])
+        max_prb = np.max(current_state[PRB_FEATURE_IDX:PRB_FEATURE_IDX + self.n_cells])
+        prev_max_cpu = np.max(prev_state[CPU_FEATURE_IDX:CPU_FEATURE_IDX + self.n_cells])
+        prev_max_prb = np.max(prev_state[PRB_FEATURE_IDX:PRB_FEATURE_IDX + self.n_cells])
 
-        # Penalize energy consumption per step, not total accumulated
-        energy_consumption_penalty = config['energy_consumption_penalty'] * energy_kwh
+        # safe / danger cutoffs
+        safe_drop = 0.9 * drop_th
+        safe_latency = 0.9 * latency_th
+        safe_cpu = 0.9 * cpu_th
+        safe_prb = 0.9 * prb_th
 
-        # --- Penalty for Drop Rate (Combined) ---
-        drop_penalty, latency_penalty, cpu_penalty, prb_penalty = 0.0, 0.0, 0.0, 0.0
+        danger_drop = 0.8 * drop_th
+        danger_latency = 0.8 * latency_th
+        danger_cpu = 0.8 * cpu_th
+        danger_prb = 0.8 * prb_th
 
-        if current_drop_rate > drop_threshold:
-            excess = current_drop_rate - drop_threshold
-            drop_penalty = self.violation_event_penalty - self.drop_magnitude_penalty_coef * (excess**2)
+        # gradients (positive when improve)
+        drop_grad = prev_drop - current_drop
+        latency_grad = (prev_latency - current_latency) / max(1e-6, latency_th)
+        cpu_grad = (prev_max_cpu - max_cpu) / max(1e-6, cpu_th)
+        prb_grad = (prev_max_prb - max_prb) / max(1e-6, prb_th)
+        energy_grad = (prev_energy - current_energy) / max(1e-6, current_energy)
 
-        if current_latency > latency_threshold:
-            excess = current_latency - latency_threshold
-            latency_penalty = self.violation_event_penalty - self.latency_magnitude_penalty_coef * (excess**2)
-            
-        if max_cpu_usage > cpu_threshold:
-            excess = max_cpu_usage - cpu_threshold
-            cpu_penalty = self.violation_event_penalty - self.cpu_magnitude_penalty_coef * (excess**2)
+        # --- REWARD DECOMPOSITION ---
+        # reward khi prev hoặc current unsafe — tức khi agent đang/đã cải thiện từ trạng thái xấu
+        drop_improvement = config['qos_grad_coeff'] * drop_grad if (prev_drop > safe_drop or current_drop > safe_drop) else 0.0
+        latency_improvement = config['qos_grad_coeff'] * latency_grad if (prev_latency > safe_latency or current_latency > safe_latency) else 0.0
+        cpu_improvement = config['cpu_grad_coeff'] * cpu_grad if (prev_max_cpu > safe_cpu or max_cpu > safe_cpu) else 0.0
+        prb_improvement = config['prb_grad_coeff'] * prb_grad if (prev_max_prb > safe_prb or max_prb > safe_prb) else 0.0
 
-        if max_prb_usage > prb_threshold:
-            excess = max_prb_usage - prb_threshold
-            prb_penalty = self.violation_event_penalty - self.prb_magnitude_penalty_coef * (excess**2)
+        energy_efficiency_reward = 0.0
+        stability_pen = 0.0
+        energy_consumption_penalty = 0.0
+        violation_penalty = 0.0
 
-        # --- Reward for Improvement (MODIFIED V2) ---
+        if (current_drop <= safe_drop) \
+            and (current_latency <= safe_latency) \
+            and (max_cpu <= safe_cpu) \
+            and (max_prb <= safe_prb):
 
-        # 1. Define "Safe Zones" (e.g., 80% or 90% of the threshold)
-        safe_drop_threshold = drop_threshold * 0.9
-        safe_latency_threshold = latency_threshold * 0.9
+            # QoS safe → optimize energy
+            energy_efficiency_reward = config['energy_grad_coeff'] * energy_grad + config['baseline_reward']
 
-        # 2. Calculate improvement value as before
-        drop_improvement_val = prev_drop_rate - current_drop_rate
-        latency_improvement_val = (prev_latency - current_latency) * 0.1
-        
-        drop_improvement = 0.0
-        latency_improvement = 0.0
+            # discourage moving too close to danger zone
+            if current_drop > danger_drop:
+                stability_pen += (current_drop - danger_drop) / max(1e-6, drop_th)
+            if current_latency > danger_latency:
+                stability_pen += (current_latency - danger_latency) / max(1e-6, latency_th)
+            if max_cpu > danger_cpu:
+                stability_pen += (max_cpu - danger_cpu) / max(1e-6, cpu_th)
+            if max_prb > danger_prb:
+                stability_pen += (max_prb - danger_prb) / max(1e-6, prb_th)
+                
+            stability_pen = config['stability_penalty'] * stability_pen
 
-        # 3. LOGIC MỚI: Chỉ tính 'improvement' (thưởng hoặc phạt)
-        #    nếu state (trước hoặc sau) nằm ngoài vùng an toàn.
-        
-        if (prev_drop_rate > safe_drop_threshold) or (current_drop_rate > safe_drop_threshold):
-            # Nếu state trước (prev) KHÔNG an toàn, HOẶC state hiện tại (current) KHÔNG an toàn
-            # thì chúng ta mới "quan tâm" đến việc di chuyển (improvement/degradation).
-            drop_improvement = self.improvement_coeff * drop_improvement_val
-        
-        # Ngược lại (else):
-        # Nếu cả prev_drop_rate VÀ current_drop_rate đều NẰM TRONG vùng an toàn
-        # (ví dụ: 0.5% và 0.8%, đều < 0.9%)
-        # thì drop_improvement = 0.0.
-        # Agent sẽ không bị phạt khi đi từ 0.5% -> 0.8%.
-        
-        if (prev_latency > safe_latency_threshold) or (current_latency > safe_latency_threshold):
-            latency_improvement = self.improvement_coeff * latency_improvement_val
+            # --- ENERGY COST ---
+            time_step = current_state[3]
+            energy_consumption = (current_energy / 1000) * (time_step / 3600)
+            energy_consumption_penalty = -config['energy_consumption_penalty'] * energy_consumption + config['baseline_reward']
 
-        # --- Total Reward ---
+        # --- ABSOLUTE VIOLATION PENALTY (applies regardless of safe block) ---
+        # Penalize how far each QoS metric exceeds its threshold (normalized)
+        drop_violation = max(0.0, (current_drop - drop_th) / max(1e-6, drop_th))
+        latency_violation = max(0.0, (current_latency - latency_th) / max(1e-6, latency_th))
+        cpu_violation = max(0.0, (max_cpu - cpu_th) / max(1e-6, cpu_th))
+        prb_violation = max(0.0, (max_prb - prb_th) / max(1e-6, prb_th))
+        violation_penalty = drop_violation + latency_violation + cpu_violation + prb_violation 
+        violation_penalty = config['violation_penalty'] * violation_penalty
+        if violation_penalty != 0:
+            violation_penalty -= config['baseline_reward']
+
+        # --- TOTAL REWARD ---
         total_reward = (
-            energy_efficiency_reward
-            + drop_penalty
-            + latency_penalty
-            + cpu_penalty
-            + prb_penalty
-            + drop_improvement
+            drop_improvement
             + latency_improvement
+            + cpu_improvement
+            + prb_improvement
+            + energy_efficiency_reward
+            + stability_pen 
+            + violation_penalty 
             + energy_consumption_penalty
         )
-        
-        # Update episodic metrics (accumulated from all envs)
-        self.episodic_metrics['total_reward'] += total_reward
-        self.episodic_metrics['drop_penalty'] += drop_penalty
-        self.episodic_metrics['latency_penalty'] += latency_penalty
-        self.episodic_metrics['cpu_penalty'] += cpu_penalty
-        self.episodic_metrics['prb_penalty'] += prb_penalty
-        self.episodic_metrics['drop_improvement'] += drop_improvement
-        self.episodic_metrics['latency_improvement'] += latency_improvement
-        self.episodic_metrics['energy_consumption_penalty'] += energy_consumption_penalty
-        self.episodic_metrics['energy_efficiency_reward'] += energy_efficiency_reward
-        
-        # Track metrics only for env 0 to avoid 4x duplication in plots
+
         if env_id == 0:
-            self.metrics['drop_rate'].append(current_drop_rate)
+            # --- METRICS LOGGING ---
+            if np.random.random() < 0.02:
+                print("total_reward: ", f"{total_reward:.5f}", 
+                    "\ndrop_improvement: ", f"{drop_improvement:.5f}", 
+                    "\nlatency_improvement: ", f"{latency_improvement:.5f}", 
+                    "\ncpu_improvement: ", f"{cpu_improvement:.5f}", 
+                    "\nprb_improvement: ", f"{prb_improvement:.5f}", 
+                    "\nenergy_efficiency_reward: ", f"{energy_efficiency_reward:.5f}", 
+                    "\nstability_penalty: ", f"{stability_pen:.5f}", 
+                    "\nviolation_penalty: ", f"{violation_penalty:.5f}", 
+                    "\nenergy_consumption_penalty: ", f"{energy_consumption_penalty:.5f}")
+            
+            self.metrics['drop_rate'].append(current_drop)
             self.metrics['latency'].append(current_latency)
+            self.metrics['cpu'].append(max_cpu)
+            self.metrics['prb'].append(max_prb)
             self.metrics['energy_efficiency_reward'].append(energy_efficiency_reward)
-            self.metrics['drop_penalty'].append(drop_penalty)
-            self.metrics['latency_penalty'].append(latency_penalty)
-            self.metrics['cpu_penalty'].append(cpu_penalty)
-            self.metrics['prb_penalty'].append(prb_penalty)
             self.metrics['drop_improvement'].append(drop_improvement)
             self.metrics['latency_improvement'].append(latency_improvement)
+            self.metrics['cpu_improvement'].append(cpu_improvement)
+            self.metrics['prb_improvement'].append(prb_improvement)
+            self.metrics['stability_penalty'].append(stability_pen)
+            self.metrics['energy_consumption_penalty'].append(energy_consumption_penalty)
             self.metrics['total_reward'].append(total_reward)
 
-        return total_reward
+        return float(total_reward)
+
     
     # NOT REMOVED FOR INTERACTING WITH SIMULATION (CAN BE MODIFIED)
     def update(self, state, action, next_state, done, env_id=0):
@@ -676,8 +657,8 @@ class RLAgent:
         normalized_state = self.normalize_state(raw_state)
         normalized_padded_state = self.pad_state(normalized_state)
         # Use prev_state to compute deltas (same as in get_action)
-        prev_state_for_deltas = self.prev_states[env_id]
-        state = self.augment_state(raw_state, normalized_padded_state, env_id, prev_state_for_deltas)
+        prev_state_raw = self.prev_states[env_id]
+        state = self.augment_state(raw_state, normalized_padded_state, prev_state_raw)
         action = np.array(padded_action).flatten()
         
         # Update prev_state for next step (AFTER using it for deltas)
@@ -790,6 +771,7 @@ class RLAgent:
         for epoch in range(self.ppo_epochs):
             epoch_actor_losses = []
             epoch_critic_losses = []
+            epoch_entropies = []
             
             for batch_states, batch_actions, batch_old_log_probs, batch_advantages, batch_returns in loader:          
                 # Stateless: seq_len=1, hidden=None
@@ -797,16 +779,20 @@ class RLAgent:
                 action_mean = action_mean.squeeze(1)  # (batch_size, action_dim)
                 action_logstd = action_logstd.squeeze(1)
                 action_logstd = torch.clamp(action_logstd, min=-20.0, max=2.0)
-                dist = torch.distributions.Normal(action_mean, torch.exp(action_logstd))       
-
+                dist = torch.distributions.Normal(action_mean, torch.exp(action_logstd)) 
+                
                 log_probs_all = dist.log_prob(batch_actions)   # (batch_size, action_dim)
+                # Entropy tracking (masked to active cells)
+                entropy_all = dist.entropy()  # (batch_size, action_dim)
 
                 # build mask and average
                 mask = torch.zeros_like(log_probs_all)
                 mask[:, :self.n_cells] = 1.0
                 active_counts = mask.sum(dim=-1).clamp(min=1.0)
                 new_log_probs = (log_probs_all * mask).sum(dim=-1) / active_counts
-
+                batch_entropy = (entropy_all * mask).sum(dim=-1) / active_counts
+                epoch_entropies.append(batch_entropy.mean().item())
+                
                 log_ratio = new_log_probs - batch_old_log_probs
                 log_ratio = torch.clamp(log_ratio, min=-10.0, max=10.0)
                 ratio = torch.exp(log_ratio)
@@ -838,11 +824,13 @@ class RLAgent:
             
             avg_actor_loss = np.mean(epoch_actor_losses)
             avg_critic_loss = np.mean(epoch_critic_losses)
-            self.logger.info(f"Epoch {epoch+1}/{self.ppo_epochs}: Actor loss={avg_actor_loss:.4f}, Critic loss={avg_critic_loss:.4f}")
+            avg_entropy = float(np.mean(epoch_entropies)) if len(epoch_entropies) > 0 else 0.0
+            self.logger.info(f"Epoch {epoch+1}/{self.ppo_epochs}: Actor loss={avg_actor_loss:.4f}, Critic loss={avg_critic_loss:.4f}, Entropy={avg_entropy:.4f}")
         
         # Track losses
         self.metrics['actor_loss'].append(avg_actor_loss)
         self.metrics['critic_loss'].append(avg_critic_loss)
+        self.metrics['entropy'].append(avg_entropy)
                 
         self.logger.info(f"Training completed: Actor loss={actor_loss:.4f}, "
                         f"Critic loss={critic_loss:.4f}")
@@ -893,23 +881,17 @@ class RLAgent:
         fig, axes = plt.subplots(2, 2, figsize=(12, 8))
         fig.suptitle(f'Episode {self.total_episodes} Metrics')
         
-        # QoS metrics
-        if self.metrics['drop_rate']:
-            axes[0,0].plot(self.metrics['drop_rate'], alpha=0.3, label='Drop Rate')
-            axes[0,0].plot(ma(self.metrics['drop_rate']), label='Drop Rate MA', linewidth=2)
-            axes[0,0].set_ylabel('Drop Rate'); axes[0,0].legend()
-        
-        if self.metrics['latency']:
-            ax2 = axes[0,0].twinx()
-            ax2.plot(self.metrics['latency'], 'orange', alpha=0.3, label='Latency')
-            ax2.plot(ma(self.metrics['latency']), 'orange', label='Latency MA', linewidth=2)
-            ax2.set_ylabel('Latency'); ax2.legend(loc='upper right')
+        # Entropy and Energy metrics
+        if self.metrics['entropy']:
+            axes[0,0].plot(self.metrics['entropy'], alpha=0.3, label='Entropy')
+            axes[0,0].plot(ma(self.metrics['entropy']), label='Entropy MA', linewidth=2)
+            axes[0,0].set_ylabel('Entropy'); axes[0,0].legend()
         
         # Reward components
         if self.metrics['energy_efficiency_reward']:
             axes[0,1].plot(ma(self.metrics['energy_efficiency_reward']), label='Energy Efficiency Reward')
-            axes[0,1].plot(ma(self.metrics['drop_penalty']), label='Drop Penalty')
-            axes[0,1].plot(ma(self.metrics['latency_penalty']), label='Latency Penalty')
+            axes[0,1].plot(ma(self.metrics['stability_penalty']), label='Stability Penalty')
+            axes[0,1].plot(ma(self.metrics['energy_consumption_penalty']), label='Energy Consumption Penalty')
             axes[0,1].set_ylabel('Reward Components'); axes[0,1].legend()
         
         # Total reward
