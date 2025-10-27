@@ -17,6 +17,12 @@ from .models import Actor
 from .models import Critic
 from .state_normalizer import StateNormalizer
 
+torch.manual_seed(42)
+np.random.seed(42)
+torch.cuda.manual_seed_all(42)
+torch.backends.cudnn.deterministic = True
+torch.backends.cudnn.benchmark = False
+
 config = yaml.safe_load(open('app/energy_agent/config.yaml'))
 
 class RLAgent:
@@ -596,7 +602,10 @@ class RLAgent:
             violation_penalty -= config['baseline_reward']
         
         warning_reward = 0.0
-        if (current_drop < drop_th and current_drop > danger_drop):
+        if (current_drop < drop_th and current_drop > danger_drop)\
+        or (current_latency < latency_th and current_latency > danger_latency)\
+        or (max_cpu < cpu_th and max_cpu > danger_cpu)\
+        or (max_prb < prb_th and max_prb > danger_prb):
             warning_reward = config['baseline_reward'] / 4
         
         # --- TOTAL REWARD ---
