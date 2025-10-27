@@ -596,10 +596,7 @@ class RLAgent:
             violation_penalty -= config['baseline_reward']
         
         warning_reward = 0.0
-        if (current_drop < drop_th and current_drop > danger_drop) \
-            and (current_latency < latency_th and current_latency > danger_latency) \
-            and (max_cpu < cpu_th and max_cpu > danger_cpu) \
-            and (max_prb < prb_th and max_prb > danger_prb):
+        if (current_drop < drop_th and current_drop > danger_drop):
             warning_reward = config['baseline_reward'] / 4
         
         # --- TOTAL REWARD ---
