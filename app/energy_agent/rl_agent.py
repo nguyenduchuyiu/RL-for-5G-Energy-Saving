@@ -542,6 +542,11 @@ class RLAgent:
         cpu_improvement = config['cpu_grad_coeff'] * cpu_grad if (prev_max_cpu > safe_cpu or max_cpu > safe_cpu) else 0.0
         prb_improvement = config['prb_grad_coeff'] * prb_grad if (prev_max_prb > safe_prb or max_prb > safe_prb) else 0.0
 
+        drop_improvement = np.clip(drop_improvement, -10.0, 10.0)
+        latency_improvement = np.clip(latency_improvement, -10.0, 10.0)
+        cpu_improvement = np.clip(cpu_improvement, -10.0, 10.0)
+        prb_improvement = np.clip(prb_improvement, -10.0, 10.0)
+
         energy_efficiency_reward = 0.0
         stability_pen = 0.0
         energy_consumption_penalty = 0.0
@@ -580,9 +585,23 @@ class RLAgent:
         prb_violation = max(0.0, (max_prb - prb_th) / max(1e-6, prb_th))
         violation_penalty = drop_violation + latency_violation + cpu_violation + prb_violation 
         violation_penalty = config['violation_penalty'] * violation_penalty
-        if violation_penalty != 0:
-            violation_penalty -= config['baseline_reward']
 
+        if prev_drop > drop_th or current_drop > drop_th:
+            violation_penalty -= config['baseline_reward']
+        if prev_latency > latency_th or current_latency > latency_th:
+            violation_penalty -= config['baseline_reward']
+        if prev_max_cpu > cpu_th or max_cpu > cpu_th:
+            violation_penalty -= config['baseline_reward']
+        if prev_max_prb > prb_th or max_prb > prb_th:
+            violation_penalty -= config['baseline_reward']
+        
+        warning_reward = 0.0
+        if (current_drop < drop_th and current_drop > danger_drop) \
+            and (current_latency < latency_th and current_latency > danger_latency) \
+            and (max_cpu < cpu_th and max_cpu > danger_cpu) \
+            and (max_prb < prb_th and max_prb > danger_prb):
+            warning_reward = config['baseline_reward'] / 4
+        
         # --- TOTAL REWARD ---
         total_reward = (
             drop_improvement
@@ -592,6 +611,7 @@ class RLAgent:
             + energy_efficiency_reward
             + stability_pen 
             + violation_penalty 
+            + warning_reward
             + energy_consumption_penalty
         )
 
@@ -606,7 +626,8 @@ class RLAgent:
                     "\nenergy_efficiency_reward: ", f"{energy_efficiency_reward:.5f}", 
                     "\nstability_penalty: ", f"{stability_pen:.5f}", 
                     "\nviolation_penalty: ", f"{violation_penalty:.5f}", 
-                    "\nenergy_consumption_penalty: ", f"{energy_consumption_penalty:.5f}")
+                    "\nenergy_consumption_penalty: ", f"{energy_consumption_penalty:.5f}",
+                    "\nwarning_reward: ", f"{warning_reward:.5f}")
             
             self.metrics['drop_rate'].append(current_drop)
             self.metrics['latency'].append(current_latency)

@@ -20,9 +20,6 @@ lambda_gae: 0.95
 clip_epsilon: 0.2
 ppo_epochs: 8
 batch_size: 64
-buffer_size: 512
+buffer_size: 4
 n_envs: 4
 hidden_dim: 256
-
-
-
