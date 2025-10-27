@@ -1,6 +1,6 @@
 training_mode: True
 use_gpu: True
-checkpoint_path: "app/energy_agent/models/ppo_model_cur.pth"
+checkpoint_path: "app/energy_agent/models/ppo_model.pth"
 
 actor_lr: 0.0001
 critic_lr: 0.0003
@@ -19,7 +19,7 @@ gamma: 0.99
 lambda_gae: 0.95
 clip_epsilon: 0.2
 ppo_epochs: 8
-batch_size: 64
+batch_size: 2
 buffer_size: 4
 n_envs: 4
 hidden_dim: 256

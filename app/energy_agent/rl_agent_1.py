@@ -1,3 +1,4 @@
+# energy_agent/rl_agent.py
 import numpy as np
 import torch
 import torch.nn as nn
@@ -11,7 +12,7 @@ import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 
-from .transition import Transition, TransitionBuffer
+from .transition import Transition, TrajectoryBuffer
 from .models import Actor
 from .models import Critic
 from .state_normalizer import StateNormalizer
@@ -49,7 +50,10 @@ class RLAgent:
         
         # Power ratio for each cell
         self.action_dim = self.max_cells
-                                
+                
+        # Number of parallel environments
+        self.n_envs = config['n_envs']
+                
         # PPO hyperparameters
         self.gamma = config['gamma']
         self.lambda_gae = config['lambda_gae']
@@ -71,24 +75,24 @@ class RLAgent:
         self.training_mode = config['training_mode']
         self.checkpoint_path = config['checkpoint_path']
         # Experience buffer
-        self.buffer = TransitionBuffer(capacity=self.buffer_size)
+        self.buffer = TrajectoryBuffer()
         
-        self.step_per_episode = config['buffer_size']
+        self.step_per_episode = config['buffer_size'] // config['n_envs']
         self.total_episodes = int(self.max_time / self.step_per_episode)
         self.current_episode = 1
         
-        # Action and log_prob tracking
-        self.current_padded_action = np.ones(self.max_cells) * 0.7
-        self.last_log_prob = 0
+        # Per-environment action and log_prob tracking
+        self.current_padded_actions = {i: np.ones(self.max_cells) * 0.7 for i in range(self.n_envs)}
+        self.last_log_probs = {i: np.zeros(1) for i in range(self.n_envs)}
         
         # Track previous state for delta features (temporal info)
-        self.prev_states = None
+        self.prev_states = {i: None for i in range(self.n_envs)}
         
         # Metrics tracking
         self.metrics = {'drop_rate': [], 'latency': [], 'cpu': [], 'prb': [], 'energy_efficiency_reward': [], 
                        'drop_improvement': [], 'latency_improvement': [], 'cpu_improvement': [], 'prb_improvement': [],
-                       'stability_penalty': [], 'energy_consumption_penalty': [], 'violation_penalty': [], 'warning_reward': [],
-                       'total_reward': [], 'actor_loss': [], 'critic_loss': [], 'entropy': []}
+                       'stability_penalty': [], 'energy_consumption_penalty': [], 'total_reward': [], 
+                       'actor_loss': [], 'critic_loss': [], 'entropy': []}
         
                 
         self.setup_logging(log_file)
@@ -108,7 +112,7 @@ class RLAgent:
             # self.critic_optimizer.param_groups[0]['lr'] = 1e-4
         else:
             self.logger.info(f"No checkpoint found at {self.checkpoint_path}")
-    
+        
     def normalize_augmented_features(self, global_features, 
                                      load_deltas, ue_deltas, 
                                      delta_features):
@@ -181,6 +185,7 @@ class RLAgent:
         Args:
             current_state_raw (np.ndarray): Raw state vector, not normalized, not padded.
             normalized_padded_state (np.ndarray): Normalized and padded state vector.
+            env_id (int): Environment ID for tracking previous state
             prev_state_raw (np.ndarray): Previous raw state for delta computation
 
         Returns:
@@ -395,88 +400,33 @@ class RLAgent:
     
     def end_scenario(self):
         print("===================Ending scenario===================")
-        # Force the last episode to end properly
-        self.force_episode_termination()
         self.save_plots()
         self.save_model(self.checkpoint_path)
-    
-    def force_episode_termination(self):
-        """Force termination of current episode by marking last transition as done=True"""
-        # Use safe API to get last transition
-        last = self.buffer.get_last_n(1)
-        if len(last) == 0:
-            return
-            
-        last_transition = last[-1]
-        if not last_transition.done:
-            # Create a new transition with done=True
-            corrected_transition = Transition(
-                state=last_transition.state,
-                action=last_transition.action,
-                reward=last_transition.reward,
-                next_state=last_transition.next_state,
-                done=True,  # Force done=True for episode termination
-                log_prob=last_transition.log_prob,
-                value=last_transition.value
-            )
-            
-            # Replace last transition using safe API
-            flat = self.buffer.get_all_flat(include_current=True)
-            flat[-1] = corrected_transition
-            self.buffer.clear()
-            for t in flat:
-                self.buffer.add(t)
-            self.logger.info("Forced episode termination: marked last transition as done=True")
-        
-        # Train with the corrected buffer
-        if len(self.buffer) >= self.batch_size:
-            self.train()
     
     def start_episode(self):
         print(f"Starting episode: {self.current_episode}")
 
         
         # Reset per-env states
-        self.current_padded_action = np.ones(self.max_cells) * 0.7
-        self.last_log_prob = 0.0
+        for i in range(self.n_envs):
+            self.current_padded_actions[i] = np.ones(self.max_cells) * 0.7
+            self.last_log_probs[i] = np.zeros(1)
 
     
     def end_episode(self):
-        # Ensure the last transition in buffer is marked as done=True using safe API
-        last = self.buffer.get_last_n(1)
-        if len(last) > 0:
-            last_transition = last[-1]
-            if not last_transition.done:
-                # Create a new transition with done=True
-                corrected_transition = Transition(
-                    state=last_transition.state,
-                    action=last_transition.action,
-                    reward=last_transition.reward,
-                    next_state=last_transition.next_state,
-                    done=True,  # Force done=True for episode termination
-                    log_prob=last_transition.log_prob,
-                    value=last_transition.value
-                )
-                
-                # Replace last transition using safe API
-                flat = self.buffer.get_all_flat(include_current=True)
-                flat[-1] = corrected_transition
-                self.buffer.clear()
-                for t in flat:
-                    self.buffer.add(t)
-        
         self.train()
         self.current_episode += 1
         if self.current_episode < self.total_episodes:
             self.start_episode()
     
     # NOT REMOVED FOR INTERACTING WITH SIMULATION (CAN BE MODIFIED)
-    def get_action(self, state):
+    def get_action(self, state, env_id=0):
         """
         Get action from policy network
         
         Args:
             state: State vector from MATLAB interface
+            env_id: ID of the environment (for parallel envs)
             
         Returns:
             action: Power ratios for each cell [0, 1]
@@ -486,41 +436,52 @@ class RLAgent:
         normalized_state = self.normalize_state(raw_state)
         normalized_padded_state = self.pad_state(normalized_state)
         # Use prev_state to compute deltas (DON'T update yet, wait for update())
-        state = self.augment_state(raw_state, normalized_padded_state, self.prev_states)
+        state = self.augment_state(raw_state, normalized_padded_state, self.prev_states[env_id])
                 
-        # prepare tensor: shape (1, state_dim)
-        state_tensor = torch.FloatTensor(state).unsqueeze(0).to(self.device)
-
+        state_tensor = torch.FloatTensor(state).unsqueeze(0).unsqueeze(0).to(self.device)
+        
         with torch.no_grad():
-            action_mean, action_logstd = self.actor(state_tensor)
+            # Stateless: always pass None to reset GRU state
+            action_mean, action_logstd, _ = self.actor(state_tensor, None)
+            
             if self.training_mode:
+                # Sample from policy during training
                 action_std = torch.exp(action_logstd)
                 dist = torch.distributions.Normal(action_mean, action_std)
                 action = dist.sample()
             else:
+                # Use mean during evaluation
                 action = action_mean
-
+        
+        # Clamp actions to [0, 1] range
         action = torch.clamp(action, 0.0, 1.0)
-
+        
         if self.training_mode:
             with torch.no_grad():
-                # compute summed log_prob over active action dims (do NOT average)
-                n = int(self.n_cells)
                 log_prob_per_dim = dist.log_prob(action)  # shape (1, action_dim)
-                log_prob_sum = float(log_prob_per_dim[0, :n].sum().cpu().numpy())
+                # mask active dims
+                active_count = float(self.n_cells)
+                avg_log_prob = (log_prob_per_dim[:, :self.n_cells].sum(dim=-1) / (active_count + 1e-8)).cpu().numpy().flatten()[0]        
         else:
-            log_prob_sum = 0.0
-
-        self.current_padded_action = action.cpu().numpy().flatten()
+            avg_log_prob = 0.0
+        
+        # update current padded action for this env
+        self.current_padded_actions[env_id] = action.cpu().numpy().flatten()
+        
+        # truncate action to n_cells length
         truncated_action = action.squeeze()[:self.n_cells]
-        self.last_log_prob = log_prob_sum
+        
+        # Store log_prob for this env
+        self.last_log_probs[env_id] = np.array([avg_log_prob])
+        
+        # return truncated action for environment
         if not self.training_mode:
-            self.prev_states = raw_state.copy()
+            # In evaluation mode, update prev_states here (no update() call)
+            self.prev_states[env_id] = raw_state.copy()
         return truncated_action.cpu().numpy().flatten()
-
     
     ## OPTIONAL: Modify reward calculation as needed
-    def calculate_reward(self, prev_state, action, current_state):
+    def calculate_reward(self, prev_state, action, current_state, env_id=0):
         """
         Directional reward including CPU and PRB:
         - Nếu bất kỳ QoS metric (drop, latency, cpu, prb) vượt safe -> thưởng gradient (giảm metric)
@@ -660,18 +621,19 @@ class RLAgent:
             + energy_consumption_penalty
         )
 
-        # --- METRICS LOGGING ---
-        if np.random.random() < 0.02:
-            print("total_reward: ", f"{total_reward:.5f}", 
-                "\ndrop_improvement: ", f"{drop_improvement:.5f}", 
-                "\nlatency_improvement: ", f"{latency_improvement:.5f}", 
-                "\ncpu_improvement: ", f"{cpu_improvement:.5f}", 
-                "\nprb_improvement: ", f"{prb_improvement:.5f}", 
-                "\nenergy_efficiency_reward: ", f"{energy_efficiency_reward:.5f}", 
-                "\nstability_penalty: ", f"{stability_pen:.5f}", 
-                "\nviolation_penalty: ", f"{violation_penalty:.5f}", 
-                "\nenergy_consumption_penalty: ", f"{energy_consumption_penalty:.5f}",
-                "\nwarning_reward: ", f"{warning_reward:.5f}")
+        if env_id == 0:
+            # --- METRICS LOGGING ---
+            if np.random.random() < 0.02:
+                print("total_reward: ", f"{total_reward:.5f}", 
+                    "\ndrop_improvement: ", f"{drop_improvement:.5f}", 
+                    "\nlatency_improvement: ", f"{latency_improvement:.5f}", 
+                    "\ncpu_improvement: ", f"{cpu_improvement:.5f}", 
+                    "\nprb_improvement: ", f"{prb_improvement:.5f}", 
+                    "\nenergy_efficiency_reward: ", f"{energy_efficiency_reward:.5f}", 
+                    "\nstability_penalty: ", f"{stability_pen:.5f}", 
+                    "\nviolation_penalty: ", f"{violation_penalty:.5f}", 
+                    "\nenergy_consumption_penalty: ", f"{energy_consumption_penalty:.5f}",
+                    "\nwarning_reward: ", f"{warning_reward:.5f}")
             
             self.metrics['drop_rate'].append(current_drop)
             self.metrics['latency'].append(current_latency)
@@ -684,14 +646,13 @@ class RLAgent:
             self.metrics['prb_improvement'].append(prb_improvement)
             self.metrics['stability_penalty'].append(stability_pen)
             self.metrics['energy_consumption_penalty'].append(energy_consumption_penalty)
-            self.metrics['violation_penalty'].append(violation_penalty)
-            self.metrics['warning_reward'].append(warning_reward)
             self.metrics['total_reward'].append(total_reward)
 
-        return float(np.clip(total_reward, -100.0, 100.0))
+        return float(total_reward)
+
     
     # NOT REMOVED FOR INTERACTING WITH SIMULATION (CAN BE MODIFIED)
-    def update(self, state, action, next_state, done):
+    def update(self, state, action, next_state, done, env_id=0):
         """
         Update agent with experience
         
@@ -700,219 +661,206 @@ class RLAgent:
             action: Action taken
             next_state: Next state
             done: Whether episode is done
+            env_id: ID of the environment (for parallel envs)
         """
         if not self.training_mode:
             return
         
-        action = self.current_padded_action
+        # pad action to max_cells length from raw action vector
+        padded_action = self.current_padded_actions[env_id]
         
-        # Calculate actual reward using state as prev_state and next_state as current
-        actual_reward = self.calculate_reward(state, action, next_state)
+        # Calculate actual reward using raw state
+        actual_reward = self.calculate_reward(state, padded_action, next_state, env_id)
         
         # Convert inputs to numpy if needed
         if hasattr(state, 'numpy'):
             state = state.numpy()
-        if hasattr(action, 'numpy'):
-            action = action.numpy()
-        if hasattr(next_state, 'numpy'):
-            next_state = next_state.numpy()
+        if hasattr(padded_action, 'numpy'):
+            padded_action = padded_action.numpy()
+        
         
         # Ensure proper shapes
-        raw_state = np.array(state).flatten().copy()
-        state = self.normalize_state(raw_state)
-        state = self.pad_state(state)
-        state = self.augment_state(raw_state, state, self.prev_states)
+        raw_state = np.array(state).copy().flatten()
+        normalized_state = self.normalize_state(raw_state)
+        normalized_padded_state = self.pad_state(normalized_state)
+        # Use prev_state to compute deltas (same as in get_action)
+        prev_state_raw = self.prev_states[env_id]
+        state = self.augment_state(raw_state, normalized_padded_state, prev_state_raw)
+        action = np.array(padded_action).flatten()
         
-        action = np.array(action).flatten()
-        raw_next_state = np.array(next_state).flatten().copy()
-        next_state = self.normalize_state(raw_next_state)
-        next_state = self.pad_state(next_state)
-        next_state = self.augment_state(raw_next_state, next_state, raw_state)
+        # Update prev_state for next step (AFTER using it for deltas)
+        self.prev_states[env_id] = raw_state.copy()
+        
         # Get value estimates
-        state_tensor = torch.FloatTensor(state).unsqueeze(0).to(self.device)
-        next_state_tensor = torch.FloatTensor(next_state).unsqueeze(0).to(self.device)
+        state_tensor = torch.FloatTensor(state).unsqueeze(0).unsqueeze(0).to(self.device)
         
         with torch.no_grad():
-            value = self.critic(state_tensor).cpu().numpy().flatten()[0]
-            next_value = self.critic(next_state_tensor).cpu().numpy().flatten()[0]
+            # Stateless: always pass None to reset GRU state
+            value_tensor, _ = self.critic(state_tensor, None)
+            value = value_tensor.item()
         
         # Create transition
         transition = Transition(
             state=state,
             action=action,
             reward=actual_reward,
-            next_state=next_state,
             done=done,
-            log_prob=self.last_log_prob,
-            value=value
+            log_prob=self.last_log_probs[env_id][0],
+            value=value,
+            env_id=env_id
         )
-        
+                
         self.buffer.add(transition)
-        
-        # Update prev_states for next step (important for delta features)
-        self.prev_states = raw_state.copy()
-        
-        # Check for episode termination
-        if done:
-            # Natural episode termination - reset prev_states
-            self.prev_states = None
-            self.logger.info("Episode terminated naturally (done=True)")
-        elif len(self.buffer) >= self.step_per_episode and self.training_mode:
-            # Forced episode termination due to buffer size
+                
+        if len(self.buffer) >= self.buffer_size and self.training_mode:
             self.end_episode()
+            
     
-    def compute_gae_from_trajectories(self, transitions):
-        """
-        Compute advantages & returns per-trajectory.
-        transitions: list of Transition in insertion order
-        Returns: advantages (np array), returns (np array), values (np array)
-        """
-        # split into trajectories by done flags
-        trajs = []
-        cur = []
-        for t in transitions:
-            cur.append(t)
-            if t.done:
-                trajs.append(cur)
-                cur = []
-        if len(cur) > 0:
-            # if last trajectory didn't end with done, still treat as trajectory
-            trajs.append(cur)
-
-        all_advantages = []
-        all_returns = []
-        all_values = []
-
-        for traj in trajs:
-            # collect arrays
-            rewards = np.array([t.reward for t in traj], dtype=np.float32)
-            values = np.array([t.value for t in traj], dtype=np.float32)
-            dones = np.array([t.done for t in traj], dtype=np.float32)
-            # compute next_values: V_{t+1} for each t
-            # for last step next_value = 0 if done else critic(next_state)
-            # but transitions store next_state; easier: compute next_values by shifting values and append last_next_value
-            # we'll compute last_next_value via critic on last next_state
-            # fetch next_values array
-            # prepare next_state tensors
-            with torch.no_grad():
-                next_states = np.array([t.next_state for t in traj], dtype=np.float32)
-                if len(next_states) > 0:
-                    ns_tensor = torch.FloatTensor(next_states).to(self.device)
-                    next_vals = self.critic(ns_tensor).cpu().numpy().flatten()
-                else:
-                    next_vals = np.array([], dtype=np.float32)
-
-            # Now compute deltas using next_vals and dones
-            advantages = np.zeros_like(rewards)
-            last_adv = 0.0
+    def compute_gae_for_trajectory(self, rewards, values, dones, next_value):
+            """Compute GAE for a single trajectory."""
+            advantages = torch.zeros_like(rewards)
+            last_advantage = 0
+            
+            # Thêm next_value vào cuối để tính GAE dễ hơn
+            extended_values = torch.cat([values, next_value.unsqueeze(0)])
+            
             for t in reversed(range(len(rewards))):
-                next_non_terminal = 1.0 - dones[t]
-                next_value = next_vals[t] if (t < len(next_vals)) else 0.0
-                delta = rewards[t] + self.gamma * next_value * next_non_terminal - values[t]
-                advantages[t] = last_adv = delta + self.gamma * self.lambda_gae * next_non_terminal * last_adv
-
+                non_terminal = 1.0 - dones[t]
+                delta = rewards[t] + self.gamma * extended_values[t+1] * non_terminal - extended_values[t]
+                advantages[t] = last_advantage = delta + self.gamma * self.lambda_gae * non_terminal * last_advantage
+            
             returns = advantages + values
-
-            all_advantages.append(advantages)
-            all_returns.append(returns)
-            all_values.append(values)
-
-        # concat trajectories back to arrays
-        advantages = np.concatenate(all_advantages, axis=0) if len(all_advantages) > 0 else np.array([], dtype=np.float32)
-        returns = np.concatenate(all_returns, axis=0) if len(all_returns) > 0 else np.array([], dtype=np.float32)
-        values = np.concatenate(all_values, axis=0) if len(all_values) > 0 else np.array([], dtype=np.float32)
-
-        return advantages, returns, values
-
+            return advantages, returns
+    
     def train(self):
-        """Train PPO using full buffer aggregated into trajectories"""
-        if len(self.buffer) < self.batch_size:
-            return
+        # SỬA ĐỔI: Lấy dữ liệu từ buffer mới
+        states, actions, rewards, dones, old_log_probs, values, env_ids = self.buffer.get_all_and_clear()
+        
+        # Chuyển dữ liệu sang tensor
+        rewards_tensor = torch.FloatTensor(rewards).to(self.device)
+        values_tensor = torch.FloatTensor(values).to(self.device)
+        dones_tensor = torch.FloatTensor(dones).to(self.device)
+        env_ids_np = np.array(env_ids)
 
-        transitions = self.buffer.get_all_flat()  # insertion order
-        # get arrays
-        states = np.array([t.state for t in transitions], dtype=np.float32)
-        actions = np.array([t.action for t in transitions], dtype=np.float32)
-        rewards = np.array([t.reward for t in transitions], dtype=np.float32)
-        dones = np.array([t.done for t in transitions], dtype=np.float32)
-        old_log_probs = np.array([t.log_prob for t in transitions], dtype=np.float32)
-        values = np.array([t.value for t in transitions], dtype=np.float32)
-
-        # compute advantages & returns per-trajectory
-        advantages, returns, _ = self.compute_gae_from_trajectories(transitions)
-
-        # normalize advantages
-        if len(advantages) > 0:
-            advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
-
-        # convert to tensors
+        # Tính GAE riêng cho từng environment để tránh bootstrap sai giữa các env
+        unique_env_ids = np.unique(env_ids_np)
+        all_advantages = torch.zeros_like(rewards_tensor)
+        all_returns = torch.zeros_like(values_tensor)
+        
+        for env_id in unique_env_ids:
+            # Lấy indices của env này
+            env_mask = env_ids_np == env_id
+            env_indices = np.where(env_mask)[0]
+            
+            # Extract data cho env này
+            env_rewards = rewards_tensor[env_mask]
+            env_values = values_tensor[env_mask]
+            env_dones = dones_tensor[env_mask]
+            
+            # Tính next_value cho transition cuối của env này
+            # Stateless: pass None như khi collection
+            last_idx = env_indices[-1]
+            last_state = torch.FloatTensor(states[last_idx]).unsqueeze(0).unsqueeze(0).to(self.device)
+            with torch.no_grad():
+                next_value, _ = self.critic(last_state, None)
+                next_value = next_value.squeeze()
+            
+            # Tính GAE cho env này
+            env_advantages, env_returns = self.compute_gae_for_trajectory(
+                env_rewards, env_values, env_dones, next_value
+            )
+            
+            # Gán vào vị trí tương ứng
+            all_advantages[env_mask] = env_advantages
+            all_returns[env_mask] = env_returns
+        
+        advantages = all_advantages
+        returns = all_returns
+        
+        # Gộp dữ liệu thành batch lớn
         states_tensor = torch.FloatTensor(states).to(self.device)
         actions_tensor = torch.FloatTensor(actions).to(self.device)
         old_log_probs_tensor = torch.FloatTensor(old_log_probs).to(self.device)
-        advantages_tensor = torch.FloatTensor(advantages).to(self.device)
-        returns_tensor = torch.FloatTensor(returns).to(self.device)
+        # advantages and returns are already tensors on the correct device
+        advantages_tensor = advantages
+        returns_tensor = returns
+        
+        # Normalize advantages
+        if len(advantages_tensor) > 1:
+            advantages_tensor = (advantages_tensor - advantages_tensor.mean()) / (advantages_tensor.std() + 1e-8)
+        else:
+            advantages_tensor = advantages_tensor - advantages_tensor.mean()
 
-        data_size = len(states)
-        
-        # Initialize variables to track metrics from the last batch
-        final_entropy = 0.0
-        final_actor_loss = 0.0
-        final_critic_loss = 0.0
-        
+        # 4. PPO training loop - STATELESS (shuffle, mini-batch)
+        dataset = torch.utils.data.TensorDataset(states_tensor, actions_tensor, old_log_probs_tensor, advantages_tensor, returns_tensor)
+        loader = torch.utils.data.DataLoader(dataset, batch_size=self.batch_size, shuffle=True)
+
         for epoch in range(self.ppo_epochs):
-            perm = torch.randperm(data_size)
-            for start in range(0, data_size, self.batch_size):
-                idx = perm[start:start + self.batch_size]
-                batch_states = states_tensor[idx]
-                batch_actions = actions_tensor[idx]
-                batch_old_log_probs = old_log_probs_tensor[idx]
-                batch_advantages = advantages_tensor[idx]
-                batch_returns = returns_tensor[idx]
-
-                # forward
-                action_mean, action_logstd = self.actor(batch_states)
-                action_std = torch.exp(action_logstd)
-                dist = torch.distributions.Normal(action_mean, action_std)
-                new_log_probs = dist.log_prob(batch_actions).sum(-1)
+            epoch_actor_losses = []
+            epoch_critic_losses = []
+            epoch_entropies = []
+            
+            for batch_states, batch_actions, batch_old_log_probs, batch_advantages, batch_returns in loader:          
+                # Stateless: seq_len=1, hidden=None
+                action_mean, action_logstd, _ = self.actor(batch_states.unsqueeze(1), None)
+                action_mean = action_mean.squeeze(1)  # (batch_size, action_dim)
+                action_logstd = action_logstd.squeeze(1)
+                action_logstd = torch.clamp(action_logstd, min=-20.0, max=2.0)
+                dist = torch.distributions.Normal(action_mean, torch.exp(action_logstd)) 
                 
-                # Calculate entropy for tracking
-                entropy = dist.entropy().sum(-1).mean()
+                log_probs_all = dist.log_prob(batch_actions)   # (batch_size, action_dim)
+                # Entropy tracking (masked to active cells)
+                entropy_all = dist.entropy()  # (batch_size, action_dim)
 
-                ratio = torch.exp(new_log_probs - batch_old_log_probs)
+                # build mask and average
+                mask = torch.zeros_like(log_probs_all)
+                mask[:, :self.n_cells] = 1.0
+                active_counts = mask.sum(dim=-1).clamp(min=1.0)
+                new_log_probs = (log_probs_all * mask).sum(dim=-1) / active_counts
+                batch_entropy = (entropy_all * mask).sum(dim=-1) / active_counts
+                epoch_entropies.append(batch_entropy.mean().item())
+                
+                log_ratio = new_log_probs - batch_old_log_probs
+                log_ratio = torch.clamp(log_ratio, min=-10.0, max=10.0)
+                ratio = torch.exp(log_ratio)
+                
                 surr1 = ratio * batch_advantages
                 surr2 = torch.clamp(ratio, 1 - self.clip_epsilon, 1 + self.clip_epsilon) * batch_advantages
                 actor_loss = -torch.min(surr1, surr2).mean()
-
-                current_values = self.critic(batch_states).squeeze()
+                
+                # Stateless: seq_len=1, hidden=None
+                current_values, _ = self.critic(batch_states.unsqueeze(1), None)
+                current_values = current_values.squeeze(1).squeeze(-1)  # (batch_size,)
+                
                 critic_loss = nn.MSELoss()(current_values, batch_returns)
-
-                # update actor
+                
+                # Update actor
                 self.actor_optimizer.zero_grad()
                 actor_loss.backward()
                 torch.nn.utils.clip_grad_norm_(self.actor.parameters(), 0.5)
                 self.actor_optimizer.step()
-
-                # update critic
+                
+                # Update critic
                 self.critic_optimizer.zero_grad()
                 critic_loss.backward()
                 torch.nn.utils.clip_grad_norm_(self.critic.parameters(), 0.5)
                 self.critic_optimizer.step()
-
-                # Track metrics from the last epoch and last batch
-                if epoch == self.ppo_epochs - 1 and start + self.batch_size >= data_size:
-                    final_entropy = entropy.item()
-                    final_actor_loss = actor_loss.item()
-                    final_critic_loss = critic_loss.item()
-
-        # Store final metrics
-        self.metrics['entropy'].append(final_entropy)
-        self.metrics['actor_loss'].append(final_actor_loss)
-        self.metrics['critic_loss'].append(final_critic_loss)
-
-        # clear buffer after on-policy update
-        self.buffer.clear()
-        self.logger.info(f"Training completed: Actor loss={final_actor_loss:.4f}, Critic loss={final_critic_loss:.4f}, Entropy={final_entropy:.4f}")
-
+                
+                epoch_actor_losses.append(actor_loss.item())
+                epoch_critic_losses.append(critic_loss.item())
+            
+            avg_actor_loss = np.mean(epoch_actor_losses)
+            avg_critic_loss = np.mean(epoch_critic_losses)
+            avg_entropy = float(np.mean(epoch_entropies)) if len(epoch_entropies) > 0 else 0.0
+            self.logger.info(f"Epoch {epoch+1}/{self.ppo_epochs}: Actor loss={avg_actor_loss:.4f}, Critic loss={avg_critic_loss:.4f}, Entropy={avg_entropy:.4f}")
+        
+        # Track losses
+        self.metrics['actor_loss'].append(avg_actor_loss)
+        self.metrics['critic_loss'].append(avg_critic_loss)
+        self.metrics['entropy'].append(avg_entropy)
+                
+        self.logger.info(f"Training completed: Actor loss={actor_loss:.4f}, "
+                        f"Critic loss={critic_loss:.4f}")
     
     def save_model(self, filepath=None):
         """Save model parameters"""
@@ -949,7 +897,7 @@ class RLAgent:
         self.logger.info(f"Training mode set to {training}")
     
     def save_plots(self):
-        """Save comprehensive metrics plots showing all reward components"""
+        """Save metrics plots"""
         if not any(self.metrics.values()):
             return
         
@@ -957,148 +905,40 @@ class RLAgent:
             if len(data) < window: return data
             return np.convolve(data, np.ones(window)/window, mode='valid')
         
-        # Create a larger figure with more subplots for comprehensive view
-        fig, axes = plt.subplots(3, 3, figsize=(18, 12))
-        fig.suptitle(f'Episode {self.total_episodes} - Comprehensive Metrics Dashboard', fontsize=16)
+        fig, axes = plt.subplots(2, 2, figsize=(12, 8))
+        fig.suptitle(f'Episode {self.total_episodes} Metrics')
         
-        # 1. QoS Improvement Rewards (top-left)
-        if any([self.metrics['drop_improvement'], self.metrics['latency_improvement'], 
-                self.metrics['cpu_improvement'], self.metrics['prb_improvement']]):
-            if self.metrics['drop_improvement']:
-                axes[0,0].plot(ma(self.metrics['drop_improvement']), label='Drop Improvement', linewidth=2)
-            if self.metrics['latency_improvement']:
-                axes[0,0].plot(ma(self.metrics['latency_improvement']), label='Latency Improvement', linewidth=2)
-            if self.metrics['cpu_improvement']:
-                axes[0,0].plot(ma(self.metrics['cpu_improvement']), label='CPU Improvement', linewidth=2)
-            if self.metrics['prb_improvement']:
-                axes[0,0].plot(ma(self.metrics['prb_improvement']), label='PRB Improvement', linewidth=2)
-            axes[0,0].set_title('QoS Improvement Rewards')
-            axes[0,0].set_ylabel('Reward Value')
-            axes[0,0].legend(fontsize=8)
-            axes[0,0].grid(True, alpha=0.3)
-        
-        # 2. Energy & Efficiency Rewards (top-center)
-        if self.metrics['energy_efficiency_reward']:
-            axes[0,1].plot(ma(self.metrics['energy_efficiency_reward']), label='Energy Efficiency', linewidth=2, color='green')
-            if self.metrics['energy_consumption_penalty']:
-                axes[0,1].plot(ma(self.metrics['energy_consumption_penalty']), label='Energy Consumption Penalty', linewidth=2, color='red')
-            axes[0,1].set_title('Energy-Related Rewards')
-            axes[0,1].set_ylabel('Reward Value')
-            axes[0,1].legend(fontsize=8)
-            axes[0,1].grid(True, alpha=0.3)
-        
-        # 3. Penalty Components (top-right)
-        if any([self.metrics['stability_penalty'], self.metrics['violation_penalty']]):
-            if self.metrics['stability_penalty']:
-                axes[0,2].plot(ma(self.metrics['stability_penalty']), label='Stability Penalty', linewidth=2, color='orange')
-            if self.metrics['violation_penalty']:
-                axes[0,2].plot(ma(self.metrics['violation_penalty']), label='Violation Penalty', linewidth=2, color='red')
-            if self.metrics['warning_reward']:
-                axes[0,2].plot(ma(self.metrics['warning_reward']), label='Warning Reward', linewidth=2, color='yellow')
-            axes[0,2].set_title('Penalty & Warning Components')
-            axes[0,2].set_ylabel('Penalty/Reward Value')
-            axes[0,2].legend(fontsize=8)
-            axes[0,2].grid(True, alpha=0.3)
-        
-        # 4. Total Reward (middle-left)
-        if self.metrics['total_reward']:
-            axes[1,0].plot(self.metrics['total_reward'], alpha=0.3, color='blue')
-            axes[1,0].plot(ma(self.metrics['total_reward']), linewidth=2, color='darkblue', label='Total Reward MA')
-            axes[1,0].set_title('Total Reward')
-            axes[1,0].set_ylabel('Total Reward')
-            axes[1,0].legend(fontsize=8)
-            axes[1,0].grid(True, alpha=0.3)
-        
-        # 5. QoS Metrics (middle-center)
-        if any([self.metrics['drop_rate'], self.metrics['latency'], self.metrics['cpu'], self.metrics['prb']]):
-            if self.metrics['drop_rate']:
-                axes[1,1].plot(ma(self.metrics['drop_rate']), label='Drop Rate (%)', linewidth=2)
-            if self.metrics['latency']:
-                # Normalize latency for better visualization
-                latency_norm = np.array(self.metrics['latency']) / 100  # Scale down for visualization
-                axes[1,1].plot(ma(latency_norm), label='Latency (ms/100)', linewidth=2)
-            if self.metrics['cpu']:
-                axes[1,1].plot(ma(self.metrics['cpu']), label='Max CPU (%)', linewidth=2)
-            if self.metrics['prb']:
-                axes[1,1].plot(ma(self.metrics['prb']), label='Max PRB (%)', linewidth=2)
-            axes[1,1].set_title('QoS Metrics')
-            axes[1,1].set_ylabel('Metric Value')
-            axes[1,1].legend(fontsize=8)
-            axes[1,1].grid(True, alpha=0.3)
-        
-        # 6. Training Metrics (middle-right)
-        if any([self.metrics['actor_loss'], self.metrics['critic_loss'], self.metrics['entropy']]):
-            if self.metrics['actor_loss']:
-                axes[1,2].plot(self.metrics['actor_loss'], alpha=0.3, label='Actor Loss', color='red')
-                if len(self.metrics['actor_loss']) >= 5:
-                    axes[1,2].plot(ma(self.metrics['actor_loss'], 5), label='Actor Loss MA', linewidth=2, color='darkred')
-            if self.metrics['critic_loss']:
-                axes[1,2].plot(self.metrics['critic_loss'], alpha=0.3, label='Critic Loss', color='blue')
-                if len(self.metrics['critic_loss']) >= 5:
-                    axes[1,2].plot(ma(self.metrics['critic_loss'], 5), label='Critic Loss MA', linewidth=2, color='darkblue')
-            axes[1,2].set_title('Training Losses')
-            axes[1,2].set_ylabel('Loss Value')
-            axes[1,2].legend(fontsize=8)
-            axes[1,2].grid(True, alpha=0.3)
-        
-        # 7. Entropy (bottom-left)
+        # Entropy and Energy metrics
         if self.metrics['entropy']:
-            axes[2,0].plot(self.metrics['entropy'], alpha=0.3, label='Entropy', color='purple')
-            axes[2,0].plot(ma(self.metrics['entropy']), label='Entropy MA', linewidth=2, color='darkmagenta')
-            axes[2,0].set_title('Policy Entropy')
-            axes[2,0].set_ylabel('Entropy')
-            axes[2,0].set_xlabel('Training Step')
-            axes[2,0].legend(fontsize=8)
-            axes[2,0].grid(True, alpha=0.3)
+            axes[0,0].plot(self.metrics['entropy'], alpha=0.3, label='Entropy')
+            axes[0,0].plot(ma(self.metrics['entropy']), label='Entropy MA', linewidth=2)
+            axes[0,0].set_ylabel('Entropy'); axes[0,0].legend()
         
-        # 8. Reward Components Stacked (bottom-center)
-        if any([self.metrics['energy_efficiency_reward'], self.metrics['drop_improvement'], 
-                self.metrics['stability_penalty'], self.metrics['violation_penalty']]):
-            reward_components = []
-            labels = []
-            colors = []
-            
-            if self.metrics['energy_efficiency_reward']:
-                reward_components.append(ma(self.metrics['energy_efficiency_reward']))
-                labels.append('Energy Efficiency')
-                colors.append('green')
-            if self.metrics['drop_improvement']:
-                reward_components.append(ma(self.metrics['drop_improvement']))
-                labels.append('Drop Improvement')
-                colors.append('blue')
-            if self.metrics['stability_penalty']:
-                reward_components.append(ma(self.metrics['stability_penalty']))
-                labels.append('Stability Penalty')
-                colors.append('orange')
-            if self.metrics['violation_penalty']:
-                reward_components.append(ma(self.metrics['violation_penalty']))
-                labels.append('Violation Penalty')
-                colors.append('red')
-            
-            # Stack the components
-            if reward_components:
-                axes[2,1].stackplot(range(len(reward_components[0])), *reward_components, 
-                                  labels=labels, colors=colors, alpha=0.7)
-                axes[2,1].set_title('Reward Components (Stacked)')
-                axes[2,1].set_ylabel('Cumulative Reward')
-                axes[2,1].set_xlabel('Step')
-                axes[2,1].legend(fontsize=8, loc='upper left')
-                axes[2,1].grid(True, alpha=0.3)
+        # Reward components
+        if self.metrics['energy_efficiency_reward']:
+            axes[0,1].plot(ma(self.metrics['energy_efficiency_reward']), label='Energy Efficiency Reward')
+            axes[0,1].plot(ma(self.metrics['stability_penalty']), label='Stability Penalty')
+            axes[0,1].plot(ma(self.metrics['energy_consumption_penalty']), label='Energy Consumption Penalty')
+            axes[0,1].set_ylabel('Reward Components'); axes[0,1].legend()
         
-        # 9. Reward Distribution (bottom-right)
+        # Total reward
         if self.metrics['total_reward']:
-            axes[2,2].hist(self.metrics['total_reward'], bins=30, alpha=0.7, color='skyblue', edgecolor='black')
-            axes[2,2].axvline(np.mean(self.metrics['total_reward']), color='red', linestyle='--', 
-                            label=f'Mean: {np.mean(self.metrics["total_reward"]):.2f}')
-            axes[2,2].set_title('Total Reward Distribution')
-            axes[2,2].set_xlabel('Reward Value')
-            axes[2,2].set_ylabel('Frequency')
-            axes[2,2].legend(fontsize=8)
-            axes[2,2].grid(True, alpha=0.3)
+            axes[1,0].plot(self.metrics['total_reward'], alpha=0.3)
+            axes[1,0].plot(ma(self.metrics['total_reward']), linewidth=2)
+            axes[1,0].set_ylabel('Total Reward'); axes[1,0].set_xlabel('Step')
+        
+        # Losses
+        if self.metrics['actor_loss']:
+            axes[1,1].plot(self.metrics['actor_loss'], alpha=0.3, label='Actor')
+            axes[1,1].plot(self.metrics['critic_loss'], alpha=0.3, label='Critic')
+            if len(self.metrics['actor_loss']) >= 5:
+                axes[1,1].plot(ma(self.metrics['actor_loss'], 5), label='Actor MA', linewidth=2)
+                axes[1,1].plot(ma(self.metrics['critic_loss'], 5), label='Critic MA', linewidth=2)
+            axes[1,1].set_ylabel('Loss'); axes[1,1].set_xlabel('Training Step'); axes[1,1].legend()
         
         plt.tight_layout()
         os.makedirs('plots', exist_ok=True)
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        plt.savefig(f'plots/comprehensive_metrics_{timestamp}.png', dpi=300, bbox_inches='tight')
+        plt.savefig(f'plots/episode_{timestamp}.png', dpi=300)
         plt.close()
-        self.logger.info(f"Comprehensive plots saved to plots/comprehensive_metrics_{timestamp}.png")
+        self.logger.info(f"Plots saved to plots/episode_{timestamp}.png")

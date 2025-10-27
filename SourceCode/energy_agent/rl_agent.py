@@ -144,14 +144,13 @@ class RLAgent:
                 action = action_mean
                 log_prob = torch.zeros(1).to(self.device)
         
-        # Clamp actions to [0, 1] range
+        # Clamp actions to [0, 1]
         action = torch.clamp(action, 0.0, 1.0)
         
         # Store for experience replay
         self.last_state = state_tensor.cpu().numpy().flatten()
         self.last_action = action.cpu().numpy().flatten()
         self.last_log_prob = log_prob.cpu().numpy().flatten()
-        
         return action.cpu().numpy().flatten()
     
     ## OPTIONAL: Modify reward calculation as needed
