@@ -1,7 +1,6 @@
-# config for docker container
-training_mode: True
+training_mode: False
 use_gpu: True
-checkpoint_path: "energy_agent/models/ppo_model.pth"
+checkpoint_path: "models/ppo_model.pth"
 
 actor_lr: 0.00003
 critic_lr: 0.0001

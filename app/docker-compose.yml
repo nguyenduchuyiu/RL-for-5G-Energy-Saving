@@ -19,6 +19,7 @@ services:
       - ../plots:/app/plots
       - ../visualization:/app/visualization
       - ../config.yaml:/app/config.yaml
+      - ../models:/app/models
       - /tmp/.X11-unix:/tmp/.X11-unix:rw
     network_mode: host
 
