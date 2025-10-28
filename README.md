@@ -1,3 +1,8 @@
+## Train
+Run run.ipynb with 32768 simStep each scenarios
+
+## Test
+
 ```bash
 cd app
 ```

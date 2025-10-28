@@ -244,8 +244,8 @@ def handle_disconnected_ues(ues: List[UE], cells: List[Cell], sim_params: SimPar
     return ues
 
 
-def update_ue_drop_events(ues: List[UE], cells: List[Cell], current_time: float):
-    """Update UE drop events based on cell conditions"""
+def update_ue_drop_events(ues: List[UE], cells: List[Cell], current_time: float, seed: int):
+    """Update UE drop events based on cell conditions (deterministic per-UE/time)"""
     
     for ue in ues:
         if ue.serving_cell is not None and ue.session_active:
@@ -307,8 +307,9 @@ def update_ue_drop_events(ues: List[UE], cells: List[Cell], current_time: float)
                     ((ue.rsrp is not None and ue.rsrp < -110) or (ue.sinr is not None and ue.sinr < -5))):
                     drop_prob += 0.25
                 
-                # Apply drop event
-                if np.random.rand() < min(0.45, drop_prob):
+                # Apply drop event with deterministic RNG
+                rng = np.random.RandomState(seed + 8000 + ue.id + int(current_time * 100))
+                if rng.rand() < min(0.45, drop_prob):
                     ue.serving_cell = None
                     ue.rsrp = None
                     ue.rsrq = None

@@ -19,14 +19,6 @@ services:
       - ../plots:/app/plots
       - ../visualization:/app/visualization
       - ../config.yaml:/app/config.yaml
+      - ../energies.txt:/app/energies.txt
       - ../models:/app/models
       - /tmp/.X11-unix:/tmp/.X11-unix:rw
-    network_mode: host
-
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: all
-              capabilities: [gpu]

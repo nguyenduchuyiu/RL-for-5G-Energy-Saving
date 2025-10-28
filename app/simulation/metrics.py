@@ -96,9 +96,17 @@ def create_rl_state(cells: List[Cell], ues: List[UE], current_time: float, sim_p
     ]
     
     # Network features (scalar metrics from energy_metrics)
-    # Calculate total TX power and avg power ratio
+    # Calculate total TX power and avg power ratio (match MATLAB: (tx - min) / (max - min))
     total_tx_power = sum(cell.tx_power for cell in cells)
-    avg_power_ratio = np.mean([cell.tx_power / cell.max_tx_power for cell in cells]) if cells else 0
+    if cells:
+        power_ratios = []
+        for cell in cells:
+            denom = (cell.max_tx_power - cell.min_tx_power)
+            ratio = (cell.tx_power - cell.min_tx_power) / (denom if denom != 0 else 1e-9)
+            power_ratios.append(ratio)
+        avg_power_ratio = float(np.mean(power_ratios))
+    else:
+        avg_power_ratio = 0
     kpi_violations = energy_metrics['cpu_violations'] + energy_metrics['prb_violations']
     
     network_features = [

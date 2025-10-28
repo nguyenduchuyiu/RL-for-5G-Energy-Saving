@@ -1,12 +1,12 @@
 """Traffic generation and cell resource usage - ported from updateTrafficGeneration.m and updateCellResourceUsage.m"""
 
 import numpy as np
-from typing import List
+from typing import List, Optional
 from .network import Cell, UE
 from .scenario_loader import SimParams
 
 
-def update_traffic_generation(ues: List[UE], cells: List[Cell], current_time: float, sim_params: SimParams):
+def update_traffic_generation(ues: List[UE], cells: List[Cell], current_time: float, sim_params: SimParams, seed: Optional[int] = None):
     """Generate traffic for each UE and update cell loads"""
     
     peak_hour_factor = sim_params.peak_hour_multiplier
@@ -17,11 +17,20 @@ def update_traffic_generation(ues: List[UE], cells: List[Cell], current_time: fl
         cell.current_load = 0
         cell.connected_ues = []
     
+    # Prepare deterministic RNG per-step (mimic MATLAB's global stream) when seed provided
+    step_rng = None
+    if seed is not None:
+        step_seed = seed + 7000 + int(current_time * 100)
+        step_rng = np.random.RandomState(step_seed)
+
     # Generate traffic for each UE
     for ue in ues:
         if ue.serving_cell is not None and ue.serving_cell > 0:
             # Generate Poisson traffic demand
-            traffic_demand = np.random.poisson(lambda_val / len(ues))
+            if step_rng is not None:
+                traffic_demand = step_rng.poisson(lambda_val / max(1, len(ues)))
+            else:
+                traffic_demand = np.random.poisson(lambda_val / max(1, len(ues)))
             ue.traffic_demand = float(traffic_demand)
             ue.session_active = traffic_demand > 0
             

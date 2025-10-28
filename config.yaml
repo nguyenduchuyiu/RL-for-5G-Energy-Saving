@@ -1,5 +1,5 @@
-training_mode: False
-use_gpu: True
+training_mode: True
+use_gpu: False
 checkpoint_path: "models/ppo_model.pth"
 
 actor_lr: 0.00003
@@ -9,10 +9,8 @@ qos_grad_coeff: 10.0
 energy_grad_coeff: 5.0
 cpu_grad_coeff: 1.0
 prb_grad_coeff: 1.0
-stability_penalty: -10.0
-energy_consumption_penalty: -100.0
 violation_penalty: -50.0
-baseline_reward: 10.0
+baseline_reward: 5.0
 
 entropy_coef: 0.01
 gamma: 0.99

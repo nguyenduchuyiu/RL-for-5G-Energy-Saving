@@ -31,7 +31,8 @@ class FiveGEnvironment:
         
         # Simulation state
         self.current_step = 0
-        self.current_time = 0.0
+        # Align first decision timeProgress to MATLAB (step 1 / simTime)
+        self.current_time = self.sim_params.time_step
         self.cumulative_energy = 0.0
         
         # Results tracking
@@ -59,9 +60,9 @@ class FiveGEnvironment:
         self.cells = configure_cells(self.sites, self.sim_params)
         self.ues = initialize_ues(self.sim_params, self.sites, self.seed_value)
         
-        # Reset simulation state
-        self.current_step = 0
-        self.current_time = 0.0
+        # Reset simulation state (align first state and step index with MATLAB)
+        self.current_step = 1
+        self.current_time = self.sim_params.time_step
         self.cumulative_energy = 0.0
         self.handover_events = []
         self.energy_metrics_history = []
@@ -81,6 +82,12 @@ class FiveGEnvironment:
             self.ues, self.cells, self.sim_params,
             self.sim_params.time_step, self.current_time
         )
+        
+        # Populate initial traffic and resource usage to align first RL decision with MATLAB
+        update_traffic_generation(
+            self.ues, self.cells, self.current_time, self.sim_params, self.seed_value
+        )
+        update_cell_resource_usage(self.cells, self.ues)
         
         # Get initial state
         state = create_rl_state(self.cells, self.ues, self.current_time, self.sim_params)
@@ -111,7 +118,7 @@ class FiveGEnvironment:
         
         # Update traffic generation
         update_traffic_generation(
-            self.ues, self.cells, self.current_time, self.sim_params
+            self.ues, self.cells, self.current_time, self.sim_params, self.seed_value
         )
         
         # Update signal measurements
@@ -130,8 +137,8 @@ class FiveGEnvironment:
         # Update cell resource usage
         update_cell_resource_usage(self.cells, self.ues)
         
-        # Update UE drop events
-        update_ue_drop_events(self.ues, self.cells, self.current_time)
+        # Update UE drop events (deterministic)
+        update_ue_drop_events(self.ues, self.cells, self.current_time, self.seed_value)
         
         # Calculate energy consumption
         total_power = sum(cell.energy_consumption for cell in self.cells)
@@ -150,6 +157,7 @@ class FiveGEnvironment:
             if event.ho_success:
                 self.successful_handovers += 1
             self.handover_events.append(event)
+
         
         # Compute metrics every 10 steps
         if self.current_step % 10 == 0:
@@ -219,12 +227,20 @@ class FiveGEnvironment:
         
         action = np.clip(action, 0.0, 1.0)
         
+        # Log RL decision every step to mirror MATLAB verbosity
+        log_decision = False
+        
         for i, cell in enumerate(self.cells):
             if i < len(action):
                 power_ratio = action[i]
                 # Map ratio to actual power
-                cell.tx_power = (cell.min_tx_power + 
+                prev_power = cell.tx_power
+                new_power = (cell.min_tx_power + 
                                power_ratio * (cell.max_tx_power - cell.min_tx_power))
+                cell.tx_power = new_power
+                if log_decision:
+                    print(f'Step {self.current_step}/{self.sim_params.total_steps}: '
+                          f'RL Agent: Adjusting cell {cell.id} power from {prev_power:.1f} to {new_power:.1f} dBm')
     
     def get_results(self) -> Dict[str, Any]:
         """Get final simulation results"""
