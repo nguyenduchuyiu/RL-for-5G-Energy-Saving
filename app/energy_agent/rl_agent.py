@@ -11,7 +11,7 @@ import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 
-from .transition import Transition, TransitionBuffer
+from .transition import Transition, TrajectoryBuffer
 from .models import Actor
 from .models import Critic
 from .state_normalizer import StateNormalizer
@@ -49,6 +49,9 @@ class RLAgent:
         
         # Power ratio for each cell
         self.action_dim = self.max_cells
+        
+        # Parallel envs
+        self.n_envs = int(config.get('n_envs', 1))
                                 
         # PPO hyperparameters
         self.gamma = config['gamma']
@@ -70,19 +73,20 @@ class RLAgent:
         self.critic_optimizer = optim.Adam(self.critic.parameters(), lr=config['critic_lr'])
         self.training_mode = config['training_mode']
         self.checkpoint_path = config['checkpoint_path']
-        # Experience buffer
-        self.buffer = TransitionBuffer(capacity=self.buffer_size)
+        # Experience buffer (per-env, flat with env_id)
+        self.buffer = TrajectoryBuffer()
         
-        self.step_per_episode = config['buffer_size']
+        # Scale episode step target by number of envs to keep similar update cadence
+        self.step_per_episode = max(1, int(config['buffer_size'] // max(1, self.n_envs)))
         self.total_episodes = int(self.max_time / self.step_per_episode)
         self.current_episode = 1
         
-        # Action and log_prob tracking
-        self.current_padded_action = np.ones(self.max_cells) * 0.7
-        self.last_log_prob = 0
+        # Per-env action and log_prob tracking
+        self.current_padded_actions = {i: np.ones(self.max_cells) * 0.7 for i in range(self.n_envs)}
+        self.last_log_probs = {i: 0.0 for i in range(self.n_envs)}
         
         # Track previous state for delta features (temporal info)
-        self.prev_states = None
+        self.prev_states = {i: None for i in range(self.n_envs)}
         
         # Metrics tracking
         self.metrics = {'drop_rate': [], 'latency': [], 'cpu': [], 'prb': [], 'energy_efficiency_reward': [], 
@@ -393,88 +397,34 @@ class RLAgent:
     
     def end_scenario(self):
         print("===================Ending scenario===================")
-        # Force the last episode to end properly
-        self.force_episode_termination()
+        # Optional: final train if any data remains
         self.save_plots()
         self.save_model(self.checkpoint_path)
-    
-    def force_episode_termination(self):
-        """Force termination of current episode by marking last transition as done=True"""
-        # Use safe API to get last transition
-        last = self.buffer.get_last_n(1)
-        if len(last) == 0:
-            return
-            
-        last_transition = last[-1]
-        if not last_transition.done:
-            # Create a new transition with done=True
-            corrected_transition = Transition(
-                state=last_transition.state,
-                action=last_transition.action,
-                reward=last_transition.reward,
-                next_state=last_transition.next_state,
-                done=True,  # Force done=True for episode termination
-                log_prob=last_transition.log_prob,
-                value=last_transition.value
-            )
-            
-            # Replace last transition using safe API
-            flat = self.buffer.get_all_flat(include_current=True)
-            flat[-1] = corrected_transition
-            self.buffer.clear()
-            for t in flat:
-                self.buffer.add(t)
-            self.logger.info("Forced episode termination: marked last transition as done=True")
-        
-        # Train with the corrected buffer
-        if len(self.buffer) >= self.batch_size:
-            self.train()
     
     def start_episode(self):
         print(f"Starting episode: {self.current_episode}")
 
         
         # Reset per-env states
-        self.current_padded_action = np.ones(self.max_cells) * 0.7
-        self.last_log_prob = 0.0
+        for i in range(self.n_envs):
+            self.current_padded_actions[i] = np.ones(self.max_cells) * 0.7
+            self.last_log_probs[i] = 0.0
 
     
     def end_episode(self):
-        # Ensure the last transition in buffer is marked as done=True using safe API
-        last = self.buffer.get_last_n(1)
-        if len(last) > 0:
-            last_transition = last[-1]
-            if not last_transition.done:
-                # Create a new transition with done=True
-                corrected_transition = Transition(
-                    state=last_transition.state,
-                    action=last_transition.action,
-                    reward=last_transition.reward,
-                    next_state=last_transition.next_state,
-                    done=True,  # Force done=True for episode termination
-                    log_prob=last_transition.log_prob,
-                    value=last_transition.value
-                )
-                
-                # Replace last transition using safe API
-                flat = self.buffer.get_all_flat(include_current=True)
-                flat[-1] = corrected_transition
-                self.buffer.clear()
-                for t in flat:
-                    self.buffer.add(t)
-        
         self.train()
         self.current_episode += 1
         if self.current_episode < self.total_episodes:
             self.start_episode()
     
     # NOT REMOVED FOR INTERACTING WITH SIMULATION (CAN BE MODIFIED)
-    def get_action(self, state):
+    def get_action(self, state, env_id=0):
         """
         Get action from policy network
         
         Args:
             state: State vector from MATLAB interface
+            env_id: Environment id for parallel execution
             
         Returns:
             action: Power ratios for each cell [0, 1]
@@ -484,7 +434,7 @@ class RLAgent:
         normalized_state = self.normalize_state(raw_state)
         normalized_padded_state = self.pad_state(normalized_state)
         # Use prev_state to compute deltas (DON'T update yet, wait for update())
-        state = self.augment_state(raw_state, normalized_padded_state, self.prev_states)
+        state = self.augment_state(raw_state, normalized_padded_state, self.prev_states.get(env_id))
                 
         # prepare tensor: shape (1, state_dim)
         state_tensor = torch.FloatTensor(state).unsqueeze(0).to(self.device)
@@ -509,11 +459,11 @@ class RLAgent:
         else:
             log_prob_sum = 0.0
 
-        self.current_padded_action = action.cpu().numpy().flatten()
+        self.current_padded_actions[env_id] = action.cpu().numpy().flatten()
         truncated_action = action.squeeze()[:self.n_cells]
-        self.last_log_prob = log_prob_sum
+        self.last_log_probs[env_id] = log_prob_sum
         if not self.training_mode:
-            self.prev_states = raw_state.copy()
+            self.prev_states[env_id] = raw_state.copy()
         return truncated_action.cpu().numpy().flatten()
 
     
@@ -689,7 +639,7 @@ class RLAgent:
         return float(np.clip(total_reward, -100.0, 100.0))
     
     # NOT REMOVED FOR INTERACTING WITH SIMULATION (CAN BE MODIFIED)
-    def update(self, state, action, next_state, done):
+    def update(self, state, action, next_state, done, env_id=0):
         """
         Update agent with experience
         
@@ -698,11 +648,12 @@ class RLAgent:
             action: Action taken
             next_state: Next state
             done: Whether episode is done
+            env_id: Environment id for parallel execution
         """
         if not self.training_mode:
             return
         
-        action = self.current_padded_action
+        action = self.current_padded_actions.get(env_id, np.ones(self.max_cells) * 0.7)
         
         # Calculate actual reward using state as prev_state and next_state as current
         actual_reward = self.calculate_reward(state, action, next_state)
@@ -719,164 +670,137 @@ class RLAgent:
         raw_state = np.array(state).flatten().copy()
         state = self.normalize_state(raw_state)
         state = self.pad_state(state)
-        state = self.augment_state(raw_state, state, self.prev_states)
+        state = self.augment_state(raw_state, state, self.prev_states.get(env_id))
         
         action = np.array(action).flatten()
-        raw_next_state = np.array(next_state).flatten().copy()
-        next_state = self.normalize_state(raw_next_state)
-        next_state = self.pad_state(next_state)
-        next_state = self.augment_state(raw_next_state, next_state, raw_state)
         # Get value estimates
         state_tensor = torch.FloatTensor(state).unsqueeze(0).to(self.device)
-        next_state_tensor = torch.FloatTensor(next_state).unsqueeze(0).to(self.device)
         
         with torch.no_grad():
             value = self.critic(state_tensor).cpu().numpy().flatten()[0]
-            next_value = self.critic(next_state_tensor).cpu().numpy().flatten()[0]
         
         # Create transition
+        # Build transition with next_state retained (normalized/padded/augmented like state)
+        raw_next_state = np.array(next_state).flatten().copy()
+        next_state_norm = self.normalize_state(raw_next_state)
+        next_state_pad = self.pad_state(next_state_norm)
+        next_state_aug = self.augment_state(raw_next_state, next_state_pad, raw_state)
+
         transition = Transition(
             state=state,
             action=action,
             reward=actual_reward,
-            next_state=next_state,
+            next_state=next_state_aug,
             done=done,
-            log_prob=self.last_log_prob,
-            value=value
+            log_prob=self.last_log_probs.get(env_id, 0.0),
+            value=value,
+            env_id=env_id
         )
         
         self.buffer.add(transition)
         
         # Update prev_states for next step (important for delta features)
-        self.prev_states = raw_state.copy()
+        self.prev_states[env_id] = raw_state.copy()
         
         # Check for episode termination
         if done:
-            # Natural episode termination - reset prev_states
-            self.prev_states = None
+            # Natural episode termination - reset prev_state for this env
+            self.prev_states[env_id] = None
             self.logger.info("Episode terminated naturally (done=True)")
-        elif len(self.buffer) >= self.step_per_episode and self.training_mode:
+        elif len(self.buffer.memory) >= self.buffer_size and self.training_mode:
             # Forced episode termination due to buffer size
             self.end_episode()
     
-    def compute_gae_from_trajectories(self, transitions):
-        """
-        Compute advantages & returns per-trajectory.
-        transitions: list of Transition in insertion order
-        Returns: advantages (np array), returns (np array), values (np array)
-        """
-        # split into trajectories by done flags
-        trajs = []
-        cur = []
-        for t in transitions:
-            cur.append(t)
-            if t.done:
-                trajs.append(cur)
-                cur = []
-        if len(cur) > 0:
-            # if last trajectory didn't end with done, still treat as trajectory
-            trajs.append(cur)
-
-        all_advantages = []
-        all_returns = []
-        all_values = []
-
-        for traj in trajs:
-            # collect arrays
-            rewards = np.array([t.reward for t in traj], dtype=np.float32)
-            values = np.array([t.value for t in traj], dtype=np.float32)
-            dones = np.array([t.done for t in traj], dtype=np.float32)
-            # compute next_values: V_{t+1} for each t
-            # for last step next_value = 0 if done else critic(next_state)
-            # but transitions store next_state; easier: compute next_values by shifting values and append last_next_value
-            # we'll compute last_next_value via critic on last next_state
-            # fetch next_values array
-            # prepare next_state tensors
-            with torch.no_grad():
-                next_states = np.array([t.next_state for t in traj], dtype=np.float32)
-                if len(next_states) > 0:
-                    ns_tensor = torch.FloatTensor(next_states).to(self.device)
-                    next_vals = self.critic(ns_tensor).cpu().numpy().flatten()
-                else:
-                    next_vals = np.array([], dtype=np.float32)
-
-            # Now compute deltas using next_vals and dones
-            advantages = np.zeros_like(rewards)
-            last_adv = 0.0
-            for t in reversed(range(len(rewards))):
-                next_non_terminal = 1.0 - dones[t]
-                next_value = next_vals[t] if (t < len(next_vals)) else 0.0
-                delta = rewards[t] + self.gamma * next_value * next_non_terminal - values[t]
-                advantages[t] = last_adv = delta + self.gamma * self.lambda_gae * next_non_terminal * last_adv
-
-            returns = advantages + values
-
-            all_advantages.append(advantages)
-            all_returns.append(returns)
-            all_values.append(values)
-
-        # concat trajectories back to arrays
-        advantages = np.concatenate(all_advantages, axis=0) if len(all_advantages) > 0 else np.array([], dtype=np.float32)
-        returns = np.concatenate(all_returns, axis=0) if len(all_returns) > 0 else np.array([], dtype=np.float32)
-        values = np.concatenate(all_values, axis=0) if len(all_values) > 0 else np.array([], dtype=np.float32)
-
-        return advantages, returns, values
-
     def train(self):
-        """Train PPO using full buffer aggregated into trajectories"""
-        if len(self.buffer) < self.batch_size:
+        """Train PPO using experiences collected across parallel envs (per-env GAE)."""
+        if len(self.buffer.memory) < self.batch_size:
             return
 
-        transitions = self.buffer.get_all_flat()  # insertion order
-        # get arrays
-        states = np.array([t.state for t in transitions], dtype=np.float32)
-        actions = np.array([t.action for t in transitions], dtype=np.float32)
-        rewards = np.array([t.reward for t in transitions], dtype=np.float32)
-        dones = np.array([t.done for t in transitions], dtype=np.float32)
-        old_log_probs = np.array([t.log_prob for t in transitions], dtype=np.float32)
-        values = np.array([t.value for t in transitions], dtype=np.float32)
+        # Fetch and clear buffer
+        states, actions, rewards, next_states, dones, old_log_probs, values, env_ids = self.buffer.get_all_and_clear()
 
-        # compute advantages & returns per-trajectory
-        advantages, returns, _ = self.compute_gae_from_trajectories(transitions)
+        # convert lists -> numpy arrays / tensors
+        states = np.asarray(states, dtype=np.float32)
+        actions = np.asarray(actions, dtype=np.float32)
+        rewards = np.asarray(rewards, dtype=np.float32)
+        next_states = np.asarray(next_states, dtype=np.float32)
+        dones = np.asarray(dones, dtype=np.float32)
+        old_log_probs = np.asarray(old_log_probs, dtype=np.float32)
+        values = np.asarray(values, dtype=np.float32)
+        env_ids_np = np.asarray(env_ids, dtype=np.int32)
 
-        # normalize advantages
-        if len(advantages) > 0:
-            advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+        # To tensors
+        rewards_tensor = torch.FloatTensor(rewards).to(self.device)
+        values_tensor = torch.FloatTensor(values).to(self.device)
+        dones_tensor = torch.FloatTensor(dones).to(self.device)
+        env_ids_np = np.array(env_ids)
 
-        # convert to tensors
+        # Compute GAE per env
+        unique_envs = np.unique(env_ids_np)
+        all_advantages = torch.zeros_like(rewards_tensor)
+        all_returns = torch.zeros_like(values_tensor)
+
+        for env_id in unique_envs:
+            env_mask = (env_ids_np == env_id)
+            env_indices = np.where(env_mask)[0]
+
+            env_rewards = rewards_tensor[env_mask]
+            env_values = values_tensor[env_mask]
+            env_dones = dones_tensor[env_mask]
+
+            # Bootstrap with critic on last state of this env
+            # Use stored next_state for bootstrap when available, else last state
+            last_idx = env_indices[-1]
+            bootstrap_input = next_states[last_idx] if (next_states is not None and next_states[last_idx] is not None) else states[last_idx]
+            last_state = torch.FloatTensor(bootstrap_input).unsqueeze(0).to(self.device)
+            with torch.no_grad():
+                next_value = self.critic(last_state).squeeze()
+
+            advantages = torch.zeros_like(env_rewards)
+            last_adv = 0.0
+            # Append next_value conceptually by indexing t+1 at end
+            for t in reversed(range(len(env_rewards))):
+                non_terminal = 1.0 - env_dones[t]
+                nv = next_value if t == len(env_rewards) - 1 else env_values[t + 1]
+                delta = env_rewards[t] + self.gamma * nv * non_terminal - env_values[t]
+                last_adv = delta + self.gamma * self.lambda_gae * non_terminal * last_adv
+                advantages[t] = last_adv
+
+            returns = advantages + env_values
+            all_advantages[env_mask] = advantages
+            all_returns[env_mask] = returns
+
+        # Dataset tensors
         states_tensor = torch.FloatTensor(states).to(self.device)
         actions_tensor = torch.FloatTensor(actions).to(self.device)
         old_log_probs_tensor = torch.FloatTensor(old_log_probs).to(self.device)
-        advantages_tensor = torch.FloatTensor(advantages).to(self.device)
-        returns_tensor = torch.FloatTensor(returns).to(self.device)
+        advantages_tensor = all_advantages
+        returns_tensor = all_returns
 
-        data_size = len(states)
-        
-        # Initialize variables to track metrics from the last batch
+        # Normalize advantages
+        if len(advantages_tensor) > 1:
+            advantages_tensor = (advantages_tensor - advantages_tensor.mean()) / (advantages_tensor.std() + 1e-8)
+        else:
+            advantages_tensor = advantages_tensor - advantages_tensor.mean()
+
+        dataset = torch.utils.data.TensorDataset(
+            states_tensor, actions_tensor, old_log_probs_tensor, advantages_tensor, returns_tensor
+        )
+        loader = torch.utils.data.DataLoader(dataset, batch_size=self.batch_size, shuffle=True)
+
         final_entropy = 0.0
         final_actor_loss = 0.0
         final_critic_loss = 0.0
-        
-        for epoch in range(self.ppo_epochs):
-            perm = torch.randperm(data_size)
-            for start in range(0, data_size, self.batch_size):
-                idx = perm[start:start + self.batch_size]
-                batch_states = states_tensor[idx]
-                batch_actions = actions_tensor[idx]
-                batch_old_log_probs = old_log_probs_tensor[idx]
-                batch_advantages = advantages_tensor[idx]
-                batch_returns = returns_tensor[idx]
 
-                # forward
+        for epoch in range(self.ppo_epochs):
+            for batch_states, batch_actions, batch_old_log_probs, batch_advantages, batch_returns in loader:
                 action_mean, action_logstd = self.actor(batch_states)
                 action_std = torch.exp(action_logstd)
                 dist = torch.distributions.Normal(action_mean, action_std)
-                # sum only active action dims (first n_cells)
+
                 n = int(self.n_cells)
-                log_prob_per_dim = dist.log_prob(batch_actions)  # (batch, action_dim)
+                log_prob_per_dim = dist.log_prob(batch_actions)
                 new_log_probs = log_prob_per_dim[:, :n].sum(-1)
-                
-                # Calculate entropy for tracking
                 entropy = dist.entropy()[:, :n].sum(-1).mean()
 
                 ratio = torch.exp(new_log_probs - batch_old_log_probs)
@@ -887,31 +811,23 @@ class RLAgent:
                 current_values = self.critic(batch_states).squeeze()
                 critic_loss = nn.MSELoss()(current_values, batch_returns)
 
-                # update actor
                 self.actor_optimizer.zero_grad()
                 actor_loss.backward()
                 torch.nn.utils.clip_grad_norm_(self.actor.parameters(), 0.5)
                 self.actor_optimizer.step()
 
-                # update critic
                 self.critic_optimizer.zero_grad()
                 critic_loss.backward()
                 torch.nn.utils.clip_grad_norm_(self.critic.parameters(), 0.5)
                 self.critic_optimizer.step()
 
-                # Track metrics from the last epoch and last batch
-                if epoch == self.ppo_epochs - 1 and start + self.batch_size >= data_size:
-                    final_entropy = entropy.item()
-                    final_actor_loss = actor_loss.item()
-                    final_critic_loss = critic_loss.item()
+                final_entropy = entropy.item()
+                final_actor_loss = actor_loss.item()
+                final_critic_loss = critic_loss.item()
 
-        # Store final metrics
         self.metrics['entropy'].append(final_entropy)
         self.metrics['actor_loss'].append(final_actor_loss)
         self.metrics['critic_loss'].append(final_critic_loss)
-
-        # clear buffer after on-policy update
-        self.buffer.clear()
         self.logger.info(f"Training completed: Actor loss={final_actor_loss:.4f}, Critic loss={final_critic_loss:.4f}, Entropy={final_entropy:.4f}")
 
     

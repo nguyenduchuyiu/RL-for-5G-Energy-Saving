@@ -194,7 +194,6 @@ class RLAgent:
         # --- 1. Analyze raw state ---
         NETWORK_START_IDX = 17
         CELL_FEATURES_START_IDX = 31 # 17 (sim) + 14 (net)
-        CELL_FEATURE_COUNT = 12
 
         # Global features from simulation_features
         total_ues_config = current_state_raw[1]
@@ -218,11 +217,10 @@ class RLAgent:
         avg_cell_load = 0
         avg_cell_ues = 0
 
-        CELL_FEATURE_COUNT = 12
         CPU_FEATURE_IDX = CELL_FEATURES_START_IDX
-        PRB_FEATURE_IDX = CELL_FEATURES_START_IDX + CELL_FEATURE_COUNT
-        LOAD_FEATURE_IDX = CELL_FEATURES_START_IDX + 2 * CELL_FEATURE_COUNT
-        UE_FEATURE_IDX = CELL_FEATURES_START_IDX + 4 * CELL_FEATURE_COUNT
+        PRB_FEATURE_IDX = CELL_FEATURES_START_IDX + self.n_cells
+        LOAD_FEATURE_IDX = CELL_FEATURES_START_IDX + 2 * self.n_cells
+        UE_FEATURE_IDX = CELL_FEATURES_START_IDX + 4 * self.n_cells
         max_cpu_usage = np.max(current_state_raw[CPU_FEATURE_IDX:CPU_FEATURE_IDX + self.n_cells])
         max_prb_usage = np.max(current_state_raw[PRB_FEATURE_IDX:PRB_FEATURE_IDX + self.n_cells])
         all_cell_loads = current_state_raw[LOAD_FEATURE_IDX:LOAD_FEATURE_IDX + self.n_cells]
@@ -498,7 +496,6 @@ class RLAgent:
         # indices
         CELL_START_IDX = 17 + 14
         NETWORK_START_IDX = 17
-        CELL_FEATURE_COUNT = 12
 
         # network-level
         prev_energy = prev_state[NETWORK_START_IDX + 0]
@@ -517,7 +514,7 @@ class RLAgent:
 
         # per-cell maxima (current & prev)
         CPU_FEATURE_IDX = CELL_START_IDX
-        PRB_FEATURE_IDX = CELL_START_IDX + CELL_FEATURE_COUNT
+        PRB_FEATURE_IDX = CELL_START_IDX + self.n_cells
         max_cpu = np.max(current_state[CPU_FEATURE_IDX:CPU_FEATURE_IDX + self.n_cells])
         max_prb = np.max(current_state[PRB_FEATURE_IDX:PRB_FEATURE_IDX + self.n_cells])
         prev_max_cpu = np.max(prev_state[CPU_FEATURE_IDX:CPU_FEATURE_IDX + self.n_cells])
@@ -634,21 +631,23 @@ class RLAgent:
                     "\nviolation_penalty: ", f"{violation_penalty:.5f}", 
                     "\nenergy_consumption_penalty: ", f"{energy_consumption_penalty:.5f}",
                     "\nwarning_reward: ", f"{warning_reward:.5f}")
-            
-            self.metrics['drop_rate'].append(current_drop)
-            self.metrics['latency'].append(current_latency)
-            self.metrics['cpu'].append(max_cpu)
-            self.metrics['prb'].append(max_prb)
-            self.metrics['energy_efficiency_reward'].append(energy_efficiency_reward)
-            self.metrics['drop_improvement'].append(drop_improvement)
-            self.metrics['latency_improvement'].append(latency_improvement)
-            self.metrics['cpu_improvement'].append(cpu_improvement)
-            self.metrics['prb_improvement'].append(prb_improvement)
-            self.metrics['stability_penalty'].append(stability_pen)
-            self.metrics['energy_consumption_penalty'].append(energy_consumption_penalty)
-            self.metrics['total_reward'].append(total_reward)
+                
+                self.metrics['drop_rate'].append(current_drop)
+                self.metrics['latency'].append(current_latency)
+                self.metrics['cpu'].append(max_cpu)
+                self.metrics['prb'].append(max_prb)
+                self.metrics['energy_efficiency_reward'].append(energy_efficiency_reward)
+                self.metrics['drop_improvement'].append(drop_improvement)
+                self.metrics['latency_improvement'].append(latency_improvement)
+                self.metrics['cpu_improvement'].append(cpu_improvement)
+                self.metrics['prb_improvement'].append(prb_improvement)
+                self.metrics['stability_penalty'].append(stability_pen)
+                self.metrics['energy_consumption_penalty'].append(energy_consumption_penalty)
+                self.metrics['violation_penalty'].append(violation_penalty)
+                self.metrics['warning_reward'].append(warning_reward)
+                self.metrics['total_reward'].append(total_reward)
 
-        return float(total_reward)
+        return float(np.clip(total_reward, -100.0, 100.0))
 
     
     # NOT REMOVED FOR INTERACTING WITH SIMULATION (CAN BE MODIFIED)
