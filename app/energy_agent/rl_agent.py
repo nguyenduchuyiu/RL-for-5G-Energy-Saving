@@ -565,7 +565,7 @@ class RLAgent:
 
         if env_id == 0:
             # --- METRICS LOGGING ---
-            if np.random.random() < 1:
+            if np.random.random() < 0.02:
                 print("total_reward: ", f"{total_reward:.5f}", 
                     "\ndrop_improvement: ", f"{drop_improvement:.5f}", 
                     "\nlatency_improvement: ", f"{latency_improvement:.5f}", 
