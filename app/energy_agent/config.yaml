@@ -19,7 +19,7 @@ gamma: 0.99
 lambda_gae: 0.95
 clip_epsilon: 0.2
 ppo_epochs: 8
-batch_size: 2
-buffer_size: 4
+batch_size: 16
+buffer_size: 64
 n_envs: 4
 hidden_dim: 256

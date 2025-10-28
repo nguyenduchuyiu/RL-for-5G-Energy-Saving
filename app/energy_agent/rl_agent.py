@@ -189,7 +189,6 @@ class RLAgent:
         # --- 1. Analyze raw state ---
         NETWORK_START_IDX = 17
         CELL_FEATURES_START_IDX = 31 # 17 (sim) + 14 (net)
-        CELL_FEATURE_COUNT = 12
 
         # Global features from simulation_features
         total_ues_config = current_state_raw[1]
@@ -213,11 +212,10 @@ class RLAgent:
         avg_cell_load = 0
         avg_cell_ues = 0
 
-        CELL_FEATURE_COUNT = 12
         CPU_FEATURE_IDX = CELL_FEATURES_START_IDX
-        PRB_FEATURE_IDX = CELL_FEATURES_START_IDX + CELL_FEATURE_COUNT
-        LOAD_FEATURE_IDX = CELL_FEATURES_START_IDX + 2 * CELL_FEATURE_COUNT
-        UE_FEATURE_IDX = CELL_FEATURES_START_IDX + 4 * CELL_FEATURE_COUNT
+        PRB_FEATURE_IDX = CELL_FEATURES_START_IDX + self.n_cells
+        LOAD_FEATURE_IDX = CELL_FEATURES_START_IDX + 2 * self.n_cells
+        UE_FEATURE_IDX = CELL_FEATURES_START_IDX + 4 * self.n_cells
         max_cpu_usage = np.max(current_state_raw[CPU_FEATURE_IDX:CPU_FEATURE_IDX + self.n_cells])
         max_prb_usage = np.max(current_state_raw[PRB_FEATURE_IDX:PRB_FEATURE_IDX + self.n_cells])
         all_cell_loads = current_state_raw[LOAD_FEATURE_IDX:LOAD_FEATURE_IDX + self.n_cells]
@@ -556,7 +554,7 @@ class RLAgent:
 
         # per-cell maxima (current & prev)
         CPU_FEATURE_IDX = CELL_START_IDX
-        PRB_FEATURE_IDX = CELL_START_IDX + CELL_FEATURE_COUNT
+        PRB_FEATURE_IDX = CELL_START_IDX + self.n_cells
         max_cpu = np.max(current_state[CPU_FEATURE_IDX:CPU_FEATURE_IDX + self.n_cells])
         max_prb = np.max(current_state[PRB_FEATURE_IDX:PRB_FEATURE_IDX + self.n_cells])
         prev_max_cpu = np.max(prev_state[CPU_FEATURE_IDX:CPU_FEATURE_IDX + self.n_cells])
@@ -873,10 +871,13 @@ class RLAgent:
                 action_mean, action_logstd = self.actor(batch_states)
                 action_std = torch.exp(action_logstd)
                 dist = torch.distributions.Normal(action_mean, action_std)
-                new_log_probs = dist.log_prob(batch_actions).sum(-1)
+                # sum only active action dims (first n_cells)
+                n = int(self.n_cells)
+                log_prob_per_dim = dist.log_prob(batch_actions)  # (batch, action_dim)
+                new_log_probs = log_prob_per_dim[:, :n].sum(-1)
                 
                 # Calculate entropy for tracking
-                entropy = dist.entropy().sum(-1).mean()
+                entropy = dist.entropy()[:, :n].sum(-1).mean()
 
                 ratio = torch.exp(new_log_probs - batch_old_log_probs)
                 surr1 = ratio * batch_advantages
