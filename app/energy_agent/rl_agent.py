@@ -22,7 +22,7 @@ torch.cuda.manual_seed_all(42)
 torch.backends.cudnn.deterministic = True
 torch.backends.cudnn.benchmark = False
 
-config = yaml.safe_load(open('app/energy_agent/config.yaml'))
+config = yaml.safe_load(open('energy_agent/config.yaml'))
 
 class RLAgent:
     def __init__(self, n_cells, n_ues, max_time, log_file='rl_agent.log', use_gpu=False, max_cells=100):
@@ -61,6 +61,7 @@ class RLAgent:
         self.batch_size = config['batch_size']
         self.buffer_size = config['buffer_size']
         self.hidden_dim = config['hidden_dim']
+        self.entropy_coef = config['entropy_coef']
         
         # Normalization parameters, use original state dimension and n_cells for state normalizer
         self.state_normalizer = StateNormalizer(self.original_state_dim, n_cells=self.n_cells)
@@ -547,8 +548,8 @@ class RLAgent:
 
         if (current_drop <= safe_drop) \
             and (current_latency <= safe_latency) \
-            and (max_cpu <= safe_cpu) \
-            and (max_prb <= safe_prb):
+            and (max_cpu < cpu_th) \
+            and (max_prb < prb_th):
 
             # QoS safe → optimize energy
             energy_efficiency_reward = config['energy_grad_coeff'] * energy_grad + config['baseline_reward']
@@ -806,7 +807,8 @@ class RLAgent:
                 ratio = torch.exp(new_log_probs - batch_old_log_probs)
                 surr1 = ratio * batch_advantages
                 surr2 = torch.clamp(ratio, 1 - self.clip_epsilon, 1 + self.clip_epsilon) * batch_advantages
-                actor_loss = -torch.min(surr1, surr2).mean()
+                # Add entropy bonus to encourage exploration
+                actor_loss = -torch.min(surr1, surr2).mean() - self.entropy_coef * entropy
 
                 current_values = self.critic(batch_states).squeeze()
                 critic_loss = nn.MSELoss()(current_values, batch_returns)

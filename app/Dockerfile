@@ -59,14 +59,13 @@ RUN wget --progress=bar:force https://ssd.mathworks.com/supportfiles/downloads/R
 
 # --- Copy Application Files ---
 WORKDIR /app
-COPY runSimulationWithAnimation run_runSimulationWithAnimation.sh /app/
 COPY main_run_scenarios run_main_run_scenarios.sh /app/
-COPY scenarios/ /app/scenarios/
+COPY test_scenarios/ /app/scenarios/
 COPY energy_agent/ /app/energy_agent/
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh
 
 # --- Set Permissions and Environment ---
-RUN chmod +x runSimulationWithAnimation run_runSimulationWithAnimation.sh main_run_scenarios run_main_run_scenarios.sh /usr/local/bin/entrypoint.sh
+RUN chmod +x main_run_scenarios run_main_run_scenarios.sh /usr/local/bin/entrypoint.sh
 
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
 ENV DISPLAY=:0.0
