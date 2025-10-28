@@ -22,7 +22,7 @@ torch.cuda.manual_seed_all(42)
 torch.backends.cudnn.deterministic = True
 torch.backends.cudnn.benchmark = False
 
-config = yaml.safe_load(open('energy_agent/config.yaml'))
+config = yaml.safe_load(open('config.yaml'))
 
 class RLAgent:
     def __init__(self, n_cells, n_ues, max_time, log_file='rl_agent.log', use_gpu=False, max_cells=100):
@@ -486,7 +486,6 @@ class RLAgent:
         # indices
         CELL_START_IDX = 17 + 14
         NETWORK_START_IDX = 17
-        CELL_FEATURE_COUNT = 12
 
         # network-level
         prev_energy = prev_state[NETWORK_START_IDX + 0]
@@ -844,6 +843,7 @@ class RLAgent:
             'critic_state_dict': self.critic.state_dict(),
             'actor_optimizer_state_dict': self.actor_optimizer.state_dict(),
             'critic_optimizer_state_dict': self.critic_optimizer.state_dict(),
+            'episodes_trained': self.total_episodes,
         }
         
         torch.save(checkpoint, filepath)
@@ -857,6 +857,9 @@ class RLAgent:
         self.critic.load_state_dict(checkpoint['critic_state_dict'])
         self.actor_optimizer.load_state_dict(checkpoint['actor_optimizer_state_dict'])
         self.critic_optimizer.load_state_dict(checkpoint['critic_optimizer_state_dict'])
+        self.current_episode = checkpoint['episodes_trained'] + 1
+        self.total_episodes = checkpoint['episodes_trained'] + 1 + self.total_episodes
+        print(f"current_episode: {self.current_episode}, total_episodes: {self.total_episodes}")
         
         self.logger.info(f"Model loaded from {filepath}")
     

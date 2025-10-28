@@ -1,0 +1,26 @@
+# config for docker container
+training_mode: True
+use_gpu: True
+checkpoint_path: "energy_agent/models/ppo_model.pth"
+
+actor_lr: 0.00003
+critic_lr: 0.0001
+
+qos_grad_coeff: 10.0
+energy_grad_coeff: 5.0
+cpu_grad_coeff: 1.0
+prb_grad_coeff: 1.0
+stability_penalty: -10.0
+energy_consumption_penalty: -100.0
+violation_penalty: -50.0
+baseline_reward: 10.0
+
+entropy_coef: 0.01
+gamma: 0.99
+lambda_gae: 0.95
+clip_epsilon: 0.2
+ppo_epochs: 8
+batch_size: 64
+buffer_size: 256
+n_envs: 4
+hidden_dim: 256
