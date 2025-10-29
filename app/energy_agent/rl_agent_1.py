@@ -867,6 +867,12 @@ class RLAgent:
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             filepath = f"ppo_model_{timestamp}.pth"
         
+        # Create parent directory if it doesn't exist
+        parent_dir = os.path.dirname(filepath)
+        if parent_dir and not os.path.exists(parent_dir):
+            os.makedirs(parent_dir, exist_ok=True)
+            self.logger.info(f"Created directory: {parent_dir}")
+        
         checkpoint = {
             'actor_state_dict': self.actor.state_dict(),
             'critic_state_dict': self.critic.state_dict(),
