@@ -395,7 +395,7 @@ class RLAgent:
             self.save_model(self.checkpoint_path)
     
     def start_episode(self):
-        print(f"Starting episode: {self.current_episode}")
+        self.logger.info(f"Starting episode: {self.current_episode}")
 
         
         # Reset per-env states
