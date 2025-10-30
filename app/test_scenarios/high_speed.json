@@ -1,0 +1,41 @@
+{
+  "name": "High Speed",
+  "description": "3GPP High speed scenario for railway with linear deployment",
+  "deploymentScenario": "high_speed",
+  
+  "carrierFrequency": 4e9,
+  "systemBandwidth": 200e6,
+  "layout": "linear_railway",
+  "isd": 1732,
+  
+  "numSites": 7,
+  "numSectors": 2,
+  "antennaHeight": 35,
+  "cellRadius": 1000,
+  
+  "numUEs": 300,
+  "userDistribution": "100% of users in train",
+  "ueSpeed": 500,
+  "indoorRatio": 1.0,
+  "trainLength": 200,
+  "trackLength": 10000,
+  
+  "minTxPower": 20,
+  "maxTxPower": 46,
+  "basePower": 1200,
+  "idlePower": 300,
+  
+  "simTime": 500,
+  "timeStep": 1,
+  
+  "rsrpServingThreshold": -110,
+  "rsrpTargetThreshold": -95,
+  "rsrpMeasurementThreshold": -115,
+  "dropCallThreshold": 1,
+  "latencyThreshold": 50,
+  "cpuThreshold": 95,
+  "prbThreshold": 95,
+  
+  "trafficLambda": 30,
+  "peakHourMultiplier": 1.5
+}

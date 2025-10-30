@@ -66,6 +66,13 @@ class RLAgent:
         # Normalization parameters, use original state dimension and n_cells for state normalizer
         self.state_normalizer = StateNormalizer(self.original_state_dim, n_cells=self.n_cells)
         
+        # Reward scaling/normalization settings
+        self.use_reward_tanh_scale = bool(config.get('use_reward_tanh_scale', True))
+        self.reward_tanh_scale = float(config.get('reward_tanh_scale', 20.0))
+        self.use_reward_running_norm = bool(config.get('use_reward_running_norm', True))
+        self.reward_running_mean = 0.0
+        self.reward_running_std = 1.0
+        
         # use augmented state dimension for actor and critic
         self.actor = Actor(self.state_dim, self.action_dim, self.hidden_dim).to(self.device)
         self.critic = Critic(self.state_dim, self.hidden_dim).to(self.device)
@@ -73,7 +80,8 @@ class RLAgent:
         self.actor_optimizer = optim.Adam(self.actor.parameters(), lr=config['actor_lr'])
         self.critic_optimizer = optim.Adam(self.critic.parameters(), lr=config['critic_lr'])
         self.training_mode = config['training_mode']
-        self.checkpoint_path = config['checkpoint_path']
+        self.checkpoint_load_path = config['checkpoint_load_path']
+        self.checkpoint_save_path = config['checkpoint_save_path']
         # Experience buffer (per-env, flat with env_id)
         self.buffer = TrajectoryBuffer()
         
@@ -105,15 +113,24 @@ class RLAgent:
         self.logger.info(f"State dim: {self.state_dim}, Action dim: {self.action_dim}")
         self.logger.info(f"Device: {self.device}")
         
-        if os.path.exists(self.checkpoint_path):
-            self.load_model(self.checkpoint_path)
-            self.logger.info(f"Loaded checkpoint from {self.checkpoint_path}")
+        if os.path.exists(self.checkpoint_load_path):
+            self.load_model(self.checkpoint_load_path)
+            self.logger.info(f"Loaded checkpoint from {self.checkpoint_load_path}")
             # self.logger.info(f"Fine-tuning with learning rate 3e-5 for actor and 1e-4 for critic")
             # self.actor_optimizer.param_groups[0]['lr'] = 3e-5
             # self.critic_optimizer.param_groups[0]['lr'] = 1e-4
         else:
-            self.logger.info(f"No checkpoint found at {self.checkpoint_path}")
+            self.logger.info(f"No checkpoint found at {self.checkpoint_load_path}")
     
+    def normalize_reward(self, reward: float) -> float:
+        """Online reward normalization using running mean/std (EMA)."""
+        # Update running stats (EMA)
+        self.reward_running_mean = 0.99 * self.reward_running_mean + 0.01 * reward
+        self.reward_running_std = np.sqrt(
+            0.99 * (self.reward_running_std ** 2) + 0.01 * ((reward - self.reward_running_mean) ** 2)
+        )
+        return (reward - self.reward_running_mean) / (self.reward_running_std + 1e-8)
+
     def normalize_augmented_features(self, global_features, 
                                      load_deltas, ue_deltas, 
                                      delta_features):
@@ -392,7 +409,7 @@ class RLAgent:
         print("===================Ending scenario===================")
         if self.training_mode:
             self.save_plots()
-            self.save_model(self.checkpoint_path)
+            self.save_model(self.checkpoint_save_path)
     
     def start_episode(self):
         self.logger.info(f"Starting episode: {self.current_episode}")
@@ -502,8 +519,8 @@ class RLAgent:
         prev_max_cpu = np.max(prev_state[CPU_FEATURE_IDX:CPU_FEATURE_IDX + self.n_cells])
         prev_max_prb = np.max(prev_state[PRB_FEATURE_IDX:PRB_FEATURE_IDX + self.n_cells])
 
-        # gradients (positive when improve)
-        drop_grad = prev_drop - current_drop
+        # gradients (positive when improve) - normalize by thresholds to be scenario-invariant
+        drop_grad = (prev_drop - current_drop) / max(1e-6, drop_th)
         latency_grad = (prev_latency - current_latency) / max(1e-6, latency_th)
         cpu_grad = (prev_max_cpu - max_cpu) / max(1e-6, cpu_th)
         prb_grad = (prev_max_prb - max_prb) / max(1e-6, prb_th)
@@ -530,7 +547,7 @@ class RLAgent:
             and (max_prb < prb_th):
 
             # QoS safe → optimize energy
-            energy_efficiency_reward = config['energy_grad_coeff'] * energy_grad + config['baseline_reward']
+            energy_efficiency_reward = config['energy_grad_coeff'] * energy_grad + config['baseline_reward']/2  
             energy_efficiency_reward = np.clip(energy_efficiency_reward, -10.0, 30.0)
                 
         # --- ABSOLUTE VIOLATION PENALTY (applies regardless of safe block) ---
@@ -562,6 +579,14 @@ class RLAgent:
             + energy_efficiency_reward
             + violation_penalty 
         )
+
+        # Scale reward to a consistent range across scenarios
+        if self.use_reward_tanh_scale and self.reward_tanh_scale > 0:
+            total_reward = float(np.tanh(total_reward / self.reward_tanh_scale) * self.reward_tanh_scale)
+
+        # Online reward normalization (optional)
+        if self.use_reward_running_norm:
+            total_reward = float(self.normalize_reward(total_reward))
 
         if env_id == 0:
             # --- METRICS LOGGING ---
