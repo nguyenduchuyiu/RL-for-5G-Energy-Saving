@@ -44,8 +44,8 @@ class RLAgent:
         
         self.original_state_dim = 17 + 14 + (self.max_cells * 12)
         
-        # 9 global features + 5 delta features + 2*max_cells local features
-        self.state_dim = self.original_state_dim + 9 + 5 + 2*self.max_cells
+        # 9 global features + 4 delta features + 2*max_cells local features
+        self.state_dim = self.original_state_dim + 9 + 4 + 2*self.max_cells
         
         # Power ratio for each cell
         self.action_dim = self.max_cells
@@ -66,6 +66,13 @@ class RLAgent:
         # Normalization parameters, use original state dimension and n_cells for state normalizer
         self.state_normalizer = StateNormalizer(self.original_state_dim, n_cells=self.n_cells)
         
+        # Reward scaling/normalization settings
+        self.use_reward_tanh_scale = bool(config.get('use_reward_tanh_scale', True))
+        self.reward_tanh_scale = float(config.get('reward_tanh_scale', 20.0))
+        self.use_reward_running_norm = bool(config.get('use_reward_running_norm', True))
+        self.reward_running_mean = 0.0
+        self.reward_running_std = 1.0
+        
         # use augmented state dimension for actor and critic
         self.actor = Actor(self.state_dim, self.action_dim, self.hidden_dim).to(self.device)
         self.critic = Critic(self.state_dim, self.hidden_dim).to(self.device)
@@ -73,7 +80,8 @@ class RLAgent:
         self.actor_optimizer = optim.Adam(self.actor.parameters(), lr=config['actor_lr'])
         self.critic_optimizer = optim.Adam(self.critic.parameters(), lr=config['critic_lr'])
         self.training_mode = config['training_mode']
-        self.checkpoint_path = config['checkpoint_path']
+        self.checkpoint_load_path = config['checkpoint_load_path']
+        self.checkpoint_save_path = config['checkpoint_save_path']
         # Experience buffer (per-env, flat with env_id)
         self.buffer = TrajectoryBuffer()
         
@@ -92,7 +100,7 @@ class RLAgent:
         # Metrics tracking
         self.metrics = {'drop_rate': [], 'latency': [], 'cpu': [], 'prb': [], 'energy_efficiency_reward': [], 
                        'drop_improvement': [], 'latency_improvement': [], 'cpu_improvement': [], 'prb_improvement': [],
-                       'stability_penalty': [], 'energy_consumption_penalty': [], 'violation_penalty': [], 'warning_reward': [],
+                       'violation_penalty': [],
                        'total_reward': [], 'actor_loss': [], 'critic_loss': [], 'entropy': []}
         
                 
@@ -105,15 +113,24 @@ class RLAgent:
         self.logger.info(f"State dim: {self.state_dim}, Action dim: {self.action_dim}")
         self.logger.info(f"Device: {self.device}")
         
-        if os.path.exists(self.checkpoint_path):
-            self.load_model(self.checkpoint_path)
-            self.logger.info(f"Loaded checkpoint from {self.checkpoint_path}")
+        if os.path.exists(self.checkpoint_load_path):
+            self.load_model(self.checkpoint_load_path)
+            self.logger.info(f"Loaded checkpoint from {self.checkpoint_load_path}")
             # self.logger.info(f"Fine-tuning with learning rate 3e-5 for actor and 1e-4 for critic")
             # self.actor_optimizer.param_groups[0]['lr'] = 3e-5
             # self.critic_optimizer.param_groups[0]['lr'] = 1e-4
         else:
-            self.logger.info(f"No checkpoint found at {self.checkpoint_path}")
+            self.logger.info(f"No checkpoint found at {self.checkpoint_load_path}")
     
+    def normalize_reward(self, reward: float) -> float:
+        """Online reward normalization using running mean/std (EMA)."""
+        # Update running stats (EMA)
+        self.reward_running_mean = 0.99 * self.reward_running_mean + 0.01 * reward
+        self.reward_running_std = np.sqrt(
+            0.99 * (self.reward_running_std ** 2) + 0.01 * ((reward - self.reward_running_mean) ** 2)
+        )
+        return (reward - self.reward_running_mean) / (self.reward_running_std + 1e-8)
+
     def normalize_augmented_features(self, global_features, 
                                      load_deltas, ue_deltas, 
                                      delta_features):
@@ -147,7 +164,6 @@ class RLAgent:
             'latency_delta': [-200, 200],     # Based on avgLatency bounds  
             'energy_delta': [-5000, 5000],    # Based on totalEnergy bounds
             'active_cells_delta': [-50, 50],  # Based on activeCells bounds
-            'energy_consumption_delta': [-1, 1],
         }
 
         def normalize(val, min_v, max_v):
@@ -174,7 +190,6 @@ class RLAgent:
             normalize(delta_features[1], *bounds['latency_delta']),
             normalize(delta_features[2], *bounds['energy_delta']), 
             normalize(delta_features[3], *bounds['active_cells_delta']),
-            normalize(delta_features[4], *bounds['energy_consumption_delta'])
         ])
 
         return norm_global, norm_load_deltas, norm_ue_deltas, norm_delta_features
@@ -259,18 +274,12 @@ class RLAgent:
             latency_delta = current_latency - prev_latency
             energy_delta = current_energy - prev_energy
             active_cells_delta = active_cells - prev_active_cells
-            # Convert power (W) to energy (kWh)
-            time_step = current_state_raw[3]  # seconds
-            current_tx_power = current_state_raw[NETWORK_START_IDX + 12]
-            prev_tx_power = prev_state_raw[NETWORK_START_IDX + 12]
-            energy_consumption_delta = (current_tx_power - prev_tx_power) / 1000 * (time_step / 3600)
         else:
             # First step, no deltas
             drop_rate_delta = 0.0
             latency_delta = 0.0
             energy_delta = 0.0
             active_cells_delta = 0.0
-            energy_consumption_delta = 0.0
 
         delta_features = np.array([drop_rate_delta, latency_delta, energy_delta, active_cells_delta])
 
@@ -279,7 +288,7 @@ class RLAgent:
             dist_to_drop_thresh, dist_to_latency_thresh, dist_to_cpu_thresh, dist_to_prb_thresh,
             load_per_active_cell, power_efficiency
             ]) 
-        delta_features = np.array([drop_rate_delta, latency_delta, energy_delta, active_cells_delta, energy_consumption_delta])
+        delta_features = np.array([drop_rate_delta, latency_delta, energy_delta, active_cells_delta])
         load_deltas = np.array(load_deltas)
         ue_deltas = np.array(ue_deltas)
         
@@ -398,12 +407,12 @@ class RLAgent:
     
     def end_scenario(self):
         print("===================Ending scenario===================")
-        # Optional: final train if any data remains
-        self.save_plots()
-        self.save_model(self.checkpoint_path)
+        if self.training_mode:
+            self.save_plots()
+            self.save_model(self.checkpoint_save_path)
     
     def start_episode(self):
-        print(f"Starting episode: {self.current_episode}")
+        self.logger.info(f"Starting episode: {self.current_episode}")
 
         
         # Reset per-env states
@@ -469,7 +478,7 @@ class RLAgent:
 
     
     ## OPTIONAL: Modify reward calculation as needed
-    def calculate_reward(self, prev_state, action, current_state):
+    def calculate_reward(self, prev_state, action, current_state, env_id=0):
         """
         Directional reward including CPU and PRB:
         - Nếu bất kỳ QoS metric (drop, latency, cpu, prb) vượt safe -> thưởng gradient (giảm metric)
@@ -510,19 +519,8 @@ class RLAgent:
         prev_max_cpu = np.max(prev_state[CPU_FEATURE_IDX:CPU_FEATURE_IDX + self.n_cells])
         prev_max_prb = np.max(prev_state[PRB_FEATURE_IDX:PRB_FEATURE_IDX + self.n_cells])
 
-        # safe / danger cutoffs
-        safe_drop = 0.9 * drop_th
-        safe_latency = 0.9 * latency_th
-        safe_cpu = 0.9 * cpu_th
-        safe_prb = 0.9 * prb_th
-
-        danger_drop = 0.8 * drop_th
-        danger_latency = 0.8 * latency_th
-        danger_cpu = 0.8 * cpu_th
-        danger_prb = 0.8 * prb_th
-
-        # gradients (positive when improve)
-        drop_grad = prev_drop - current_drop
+        # gradients (positive when improve) - normalize by thresholds to be scenario-invariant
+        drop_grad = (prev_drop - current_drop) / max(1e-6, drop_th)
         latency_grad = (prev_latency - current_latency) / max(1e-6, latency_th)
         cpu_grad = (prev_max_cpu - max_cpu) / max(1e-6, cpu_th)
         prb_grad = (prev_max_prb - max_prb) / max(1e-6, prb_th)
@@ -530,46 +528,28 @@ class RLAgent:
 
         # --- REWARD DECOMPOSITION ---
         # reward khi prev hoặc current unsafe — tức khi agent đang/đã cải thiện từ trạng thái xấu
-        drop_improvement = config['qos_grad_coeff'] * drop_grad if (prev_drop > safe_drop or current_drop > safe_drop) else 0.0
-        latency_improvement = config['qos_grad_coeff'] * latency_grad if (prev_latency > safe_latency or current_latency > safe_latency) else 0.0
-        cpu_improvement = config['cpu_grad_coeff'] * cpu_grad if (prev_max_cpu > safe_cpu or max_cpu > safe_cpu) else 0.0
-        prb_improvement = config['prb_grad_coeff'] * prb_grad if (prev_max_prb > safe_prb or max_prb > safe_prb) else 0.0
+        drop_improvement = config['qos_grad_coeff'] * drop_grad if (prev_drop > drop_th or current_drop > drop_th) else 0.0
+        latency_improvement = config['qos_grad_coeff'] * latency_grad if (prev_latency > latency_th or current_latency > latency_th) else 0.0
+        cpu_improvement = config['cpu_grad_coeff'] * cpu_grad if (prev_max_cpu > cpu_th or max_cpu > cpu_th) else 0.0
+        prb_improvement = config['prb_grad_coeff'] * prb_grad if (prev_max_prb > prb_th or max_prb > prb_th) else 0.0
 
-        drop_improvement = np.clip(drop_improvement, -10.0, 10.0)
-        latency_improvement = np.clip(latency_improvement, -10.0, 10.0)
-        cpu_improvement = np.clip(cpu_improvement, -10.0, 10.0)
-        prb_improvement = np.clip(prb_improvement, -10.0, 10.0)
+        drop_improvement = np.clip(drop_improvement, -5.0, 5.0)
+        latency_improvement = np.clip(latency_improvement, -5.0, 5.0)
+        cpu_improvement = np.clip(cpu_improvement, -5.0, 5.0)
+        prb_improvement = np.clip(prb_improvement, -5.0, 5.0)
 
         energy_efficiency_reward = 0.0
-        stability_pen = 0.0
-        energy_consumption_penalty = 0.0
         violation_penalty = 0.0
 
-        if (current_drop <= safe_drop) \
-            and (current_latency <= safe_latency) \
+        if (current_drop < drop_th) \
+            and (current_latency < latency_th) \
             and (max_cpu < cpu_th) \
             and (max_prb < prb_th):
 
             # QoS safe → optimize energy
-            energy_efficiency_reward = config['energy_grad_coeff'] * energy_grad + config['baseline_reward']
-
-            # discourage moving too close to danger zone
-            if current_drop > danger_drop:
-                stability_pen += (current_drop - danger_drop) / max(1e-6, drop_th)
-            if current_latency > danger_latency:
-                stability_pen += (current_latency - danger_latency) / max(1e-6, latency_th)
-            if max_cpu > danger_cpu:
-                stability_pen += (max_cpu - danger_cpu) / max(1e-6, cpu_th)
-            if max_prb > danger_prb:
-                stability_pen += (max_prb - danger_prb) / max(1e-6, prb_th)
+            energy_efficiency_reward = config['energy_grad_coeff'] * energy_grad + config['baseline_reward']/2  
+            energy_efficiency_reward = np.clip(energy_efficiency_reward, -10.0, 30.0)
                 
-            stability_pen = config['stability_penalty'] * stability_pen
-
-            # --- ENERGY COST ---
-            time_step = current_state[3]
-            energy_consumption = (current_energy / 1000) * (time_step / 3600)
-            energy_consumption_penalty = -config['energy_consumption_penalty'] * energy_consumption + config['baseline_reward']
-
         # --- ABSOLUTE VIOLATION PENALTY (applies regardless of safe block) ---
         # Penalize how far each QoS metric exceeds its threshold (normalized)
         drop_violation = max(0.0, (current_drop - drop_th) / max(1e-6, drop_th))
@@ -587,13 +567,8 @@ class RLAgent:
             violation_penalty -= config['baseline_reward']
         if prev_max_prb > prb_th or max_prb > prb_th:
             violation_penalty -= config['baseline_reward']
-        
-        warning_reward = 0.0
-        if (current_drop < drop_th and current_drop > danger_drop)\
-        or (current_latency < latency_th and current_latency > danger_latency)\
-        or (max_cpu < cpu_th and max_cpu > danger_cpu)\
-        or (max_prb < prb_th and max_prb > danger_prb):
-            warning_reward = config['baseline_reward'] / 4
+            
+        violation_penalty = np.clip(violation_penalty, -50.0, 0.0)
         
         # --- TOTAL REWARD ---
         total_reward = (
@@ -602,39 +577,40 @@ class RLAgent:
             + cpu_improvement
             + prb_improvement
             + energy_efficiency_reward
-            + stability_pen 
             + violation_penalty 
-            + warning_reward
-            + energy_consumption_penalty
         )
 
-        # --- METRICS LOGGING ---
-        if np.random.random() < 0.02:
-            print("total_reward: ", f"{total_reward:.5f}", 
-                "\ndrop_improvement: ", f"{drop_improvement:.5f}", 
-                "\nlatency_improvement: ", f"{latency_improvement:.5f}", 
-                "\ncpu_improvement: ", f"{cpu_improvement:.5f}", 
-                "\nprb_improvement: ", f"{prb_improvement:.5f}", 
-                "\nenergy_efficiency_reward: ", f"{energy_efficiency_reward:.5f}", 
-                "\nstability_penalty: ", f"{stability_pen:.5f}", 
-                "\nviolation_penalty: ", f"{violation_penalty:.5f}", 
-                "\nenergy_consumption_penalty: ", f"{energy_consumption_penalty:.5f}",
-                "\nwarning_reward: ", f"{warning_reward:.5f}")
-            
-            self.metrics['drop_rate'].append(current_drop)
-            self.metrics['latency'].append(current_latency)
-            self.metrics['cpu'].append(max_cpu)
-            self.metrics['prb'].append(max_prb)
-            self.metrics['energy_efficiency_reward'].append(energy_efficiency_reward)
-            self.metrics['drop_improvement'].append(drop_improvement)
-            self.metrics['latency_improvement'].append(latency_improvement)
-            self.metrics['cpu_improvement'].append(cpu_improvement)
-            self.metrics['prb_improvement'].append(prb_improvement)
-            self.metrics['stability_penalty'].append(stability_pen)
-            self.metrics['energy_consumption_penalty'].append(energy_consumption_penalty)
-            self.metrics['violation_penalty'].append(violation_penalty)
-            self.metrics['warning_reward'].append(warning_reward)
-            self.metrics['total_reward'].append(total_reward)
+        # Scale reward to a consistent range across scenarios
+        if self.use_reward_tanh_scale and self.reward_tanh_scale > 0:
+            total_reward = float(np.tanh(total_reward / self.reward_tanh_scale) * self.reward_tanh_scale)
+
+        # Online reward normalization (optional)
+        if self.use_reward_running_norm:
+            total_reward = float(self.normalize_reward(total_reward))
+
+        if env_id == 0:
+            # --- METRICS LOGGING ---
+            if np.random.random() < 0.02:
+                print("total_reward: ", f"{total_reward:.5f}", 
+                    "\ndrop_improvement: ", f"{drop_improvement:.5f}", 
+                    "\nlatency_improvement: ", f"{latency_improvement:.5f}", 
+                    "\ncpu_improvement: ", f"{cpu_improvement:.5f}", 
+                    "\nprb_improvement: ", f"{prb_improvement:.5f}", 
+                    "\nenergy_efficiency_reward: ", f"{energy_efficiency_reward:.5f}", 
+                    "\nviolation_penalty: ", f"{violation_penalty:.5f}", 
+                    "\nenergy_grad: ", f"{energy_grad:.5f}"
+                )
+                self.metrics['drop_rate'].append(current_drop)
+                self.metrics['latency'].append(current_latency)
+                self.metrics['cpu'].append(max_cpu)
+                self.metrics['prb'].append(max_prb)
+                self.metrics['energy_efficiency_reward'].append(energy_efficiency_reward)
+                self.metrics['drop_improvement'].append(drop_improvement)
+                self.metrics['latency_improvement'].append(latency_improvement)
+                self.metrics['cpu_improvement'].append(cpu_improvement)
+                self.metrics['prb_improvement'].append(prb_improvement)
+                self.metrics['violation_penalty'].append(violation_penalty)
+                self.metrics['total_reward'].append(total_reward)
 
         return float(np.clip(total_reward, -100.0, 100.0))
     
@@ -656,7 +632,7 @@ class RLAgent:
         action = self.current_padded_actions.get(env_id, np.ones(self.max_cells) * 0.7)
         
         # Calculate actual reward using state as prev_state and next_state as current
-        actual_reward = self.calculate_reward(state, action, next_state)
+        actual_reward = self.calculate_reward(state, action, next_state, env_id)
         
         # Convert inputs to numpy if needed
         if hasattr(state, 'numpy'):
@@ -838,6 +814,12 @@ class RLAgent:
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             filepath = f"ppo_model_{timestamp}.pth"
         
+        # Create parent directory if it doesn't exist
+        parent_dir = os.path.dirname(filepath)
+        if parent_dir and not os.path.exists(parent_dir):
+            os.makedirs(parent_dir, exist_ok=True)
+            self.logger.info(f"Created directory: {parent_dir}")
+        
         checkpoint = {
             'actor_state_dict': self.actor.state_dict(),
             'critic_state_dict': self.critic.state_dict(),
@@ -857,9 +839,10 @@ class RLAgent:
         self.critic.load_state_dict(checkpoint['critic_state_dict'])
         self.actor_optimizer.load_state_dict(checkpoint['actor_optimizer_state_dict'])
         self.critic_optimizer.load_state_dict(checkpoint['critic_optimizer_state_dict'])
-        self.current_episode = checkpoint['episodes_trained'] + 1
-        self.total_episodes = checkpoint['episodes_trained'] + 1 + self.total_episodes
-        print(f"current_episode: {self.current_episode}, total_episodes: {self.total_episodes}")
+        if self.training_mode:
+            self.current_episode = checkpoint['episodes_trained'] + 1
+            self.total_episodes = checkpoint['episodes_trained'] + 1 + self.total_episodes
+            print(f"current_episode: {self.current_episode}, total_episodes: {self.total_episodes}")
         
         self.logger.info(f"Model loaded from {filepath}")
     
@@ -902,21 +885,15 @@ class RLAgent:
         # 2. Energy & Efficiency Rewards (top-center)
         if self.metrics['energy_efficiency_reward']:
             axes[0,1].plot(ma(self.metrics['energy_efficiency_reward']), label='Energy Efficiency', linewidth=2, color='green')
-            if self.metrics['energy_consumption_penalty']:
-                axes[0,1].plot(ma(self.metrics['energy_consumption_penalty']), label='Energy Consumption Penalty', linewidth=2, color='red')
             axes[0,1].set_title('Energy-Related Rewards')
             axes[0,1].set_ylabel('Reward Value')
             axes[0,1].legend(fontsize=8)
             axes[0,1].grid(True, alpha=0.3)
         
         # 3. Penalty Components (top-right)
-        if any([self.metrics['stability_penalty'], self.metrics['violation_penalty']]):
-            if self.metrics['stability_penalty']:
-                axes[0,2].plot(ma(self.metrics['stability_penalty']), label='Stability Penalty', linewidth=2, color='orange')
+        if any([self.metrics['violation_penalty']]):
             if self.metrics['violation_penalty']:
                 axes[0,2].plot(ma(self.metrics['violation_penalty']), label='Violation Penalty', linewidth=2, color='red')
-            if self.metrics['warning_reward']:
-                axes[0,2].plot(ma(self.metrics['warning_reward']), label='Warning Reward', linewidth=2, color='yellow')
             axes[0,2].set_title('Penalty & Warning Components')
             axes[0,2].set_ylabel('Penalty/Reward Value')
             axes[0,2].legend(fontsize=8)
@@ -975,7 +952,7 @@ class RLAgent:
         
         # 8. Reward Components Stacked (bottom-center)
         if any([self.metrics['energy_efficiency_reward'], self.metrics['drop_improvement'], 
-                self.metrics['stability_penalty'], self.metrics['violation_penalty']]):
+                self.metrics['violation_penalty']]):
             reward_components = []
             labels = []
             colors = []
@@ -988,10 +965,6 @@ class RLAgent:
                 reward_components.append(ma(self.metrics['drop_improvement']))
                 labels.append('Drop Improvement')
                 colors.append('blue')
-            if self.metrics['stability_penalty']:
-                reward_components.append(ma(self.metrics['stability_penalty']))
-                labels.append('Stability Penalty')
-                colors.append('orange')
             if self.metrics['violation_penalty']:
                 reward_components.append(ma(self.metrics['violation_penalty']))
                 labels.append('Violation Penalty')

@@ -841,7 +841,7 @@ class RLAgent:
         self.critic_optimizer.load_state_dict(checkpoint['critic_optimizer_state_dict'])
         if self.training_mode:
             self.current_episode = checkpoint['episodes_trained'] + 1
-            self.total_episodes = checkpoint['episodes_trained'] + 1 + self.total_episodes
+            self.total_episodes = self.current_episode + self.total_episodes
             print(f"current_episode: {self.current_episode}, total_episodes: {self.total_episodes}")
         
         self.logger.info(f"Model loaded from {filepath}")

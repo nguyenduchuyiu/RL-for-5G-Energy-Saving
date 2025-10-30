@@ -1,7 +1,7 @@
-training_mode: False
+training_mode: True
 use_gpu: False
 
-checkpoint_load_path: "models/ppo_model_dense_urban.pth"
+checkpoint_load_path: "models/ppo_model_dense_urban1.pth"
 checkpoint_save_path: "models/ppo_model_dense_urban_rural.pth"
 
 actor_lr: 0.00003
@@ -20,6 +20,6 @@ lambda_gae: 0.95
 clip_epsilon: 0.2
 ppo_epochs: 8
 batch_size: 64
-buffer_size: 2048    
+buffer_size: 512
 n_envs: 4
 hidden_dim: 256
