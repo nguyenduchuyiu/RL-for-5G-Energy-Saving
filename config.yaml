@@ -1,8 +1,8 @@
-training_mode: True
+training_mode: False
 use_gpu: False
 
-checkpoint_load_path: "models/ppo_model_dense_urban1.pth"
-checkpoint_save_path: "models/ppo_model_dense_urban_rural.pth"
+checkpoint_load_path: "models/ppo_model_dense_urban_rural.pth"
+checkpoint_save_path: "models/ppo_model_dense_urban_rural_high_speed.pth"
 
 actor_lr: 0.00003
 critic_lr: 0.0001
