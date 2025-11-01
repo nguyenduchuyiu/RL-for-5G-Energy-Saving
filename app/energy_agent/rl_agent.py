@@ -62,23 +62,24 @@ class RLAgent:
         self.buffer_size = config['buffer_size']
         self.hidden_dim = config['hidden_dim']
         self.entropy_coef = config['entropy_coef']
+        # Lagrangian PPO hyperparameters
+        self.lambda_lr = float(config.get('lambda_lr', 1e-3))
+        self.lambda_multiplier = float(config.get('lambda_init', 1.0))
+        self.lambda_max = float(config.get('lambda_max', 10.0))
+        self.cost_target = float(config.get('cost_target', 0.0))
         
         # Normalization parameters, use original state dimension and n_cells for state normalizer
         self.state_normalizer = StateNormalizer(self.original_state_dim, n_cells=self.n_cells)
         
-        # Reward scaling/normalization settings
-        self.use_reward_tanh_scale = bool(config.get('use_reward_tanh_scale', True))
-        self.reward_tanh_scale = float(config.get('reward_tanh_scale', 20.0))
-        self.use_reward_running_norm = bool(config.get('use_reward_running_norm', True))
-        self.reward_running_mean = 0.0
-        self.reward_running_std = 1.0
-        
         # use augmented state dimension for actor and critic
         self.actor = Actor(self.state_dim, self.action_dim, self.hidden_dim).to(self.device)
         self.critic = Critic(self.state_dim, self.hidden_dim).to(self.device)
+        # Separate cost critic for Lagrangian PPO
+        self.cost_critic = Critic(self.state_dim, self.hidden_dim).to(self.device)
         
         self.actor_optimizer = optim.Adam(self.actor.parameters(), lr=config['actor_lr'])
         self.critic_optimizer = optim.Adam(self.critic.parameters(), lr=config['critic_lr'])
+        self.cost_critic_optimizer = optim.Adam(self.cost_critic.parameters(), lr=config['critic_lr'])
         self.training_mode = config['training_mode']
         self.checkpoint_load_path = config['checkpoint_load_path']
         self.checkpoint_save_path = config['checkpoint_save_path']
@@ -97,11 +98,16 @@ class RLAgent:
         # Track previous state for delta features (temporal info)
         self.prev_states = {i: None for i in range(self.n_envs)}
         
-        # Metrics tracking
-        self.metrics = {'drop_rate': [], 'latency': [], 'cpu': [], 'prb': [], 'energy_efficiency_reward': [], 
-                       'drop_improvement': [], 'latency_improvement': [], 'cpu_improvement': [], 'prb_improvement': [],
-                       'violation_penalty': [],
-                       'total_reward': [], 'actor_loss': [], 'critic_loss': [], 'entropy': []}
+        # Metrics tracking (Lagrangian PPO essentials)
+        self.metrics = {
+            'reward': [],           # mean reward per update
+            'cost': [],             # mean cost per update
+            'lambda': [],           # lagrange multiplier
+            'actor_loss': [],
+            'critic_loss': [],
+            'cost_critic_loss': [],
+            'entropy': []
+        }
         
                 
         self.setup_logging(log_file)
@@ -121,15 +127,6 @@ class RLAgent:
             # self.critic_optimizer.param_groups[0]['lr'] = 1e-4
         else:
             self.logger.info(f"No checkpoint found at {self.checkpoint_load_path}")
-    
-    def normalize_reward(self, reward: float) -> float:
-        """Online reward normalization using running mean/std (EMA)."""
-        # Update running stats (EMA)
-        self.reward_running_mean = 0.99 * self.reward_running_mean + 0.01 * reward
-        self.reward_running_std = np.sqrt(
-            0.99 * (self.reward_running_std ** 2) + 0.01 * ((reward - self.reward_running_mean) ** 2)
-        )
-        return (reward - self.reward_running_mean) / (self.reward_running_std + 1e-8)
 
     def normalize_augmented_features(self, global_features, 
                                      load_deltas, ue_deltas, 
@@ -480,140 +477,81 @@ class RLAgent:
     ## OPTIONAL: Modify reward calculation as needed
     def calculate_reward(self, prev_state, action, current_state, env_id=0):
         """
-        Directional reward including CPU and PRB:
-        - Nếu bất kỳ QoS metric (drop, latency, cpu, prb) vượt safe -> thưởng gradient (giảm metric)
-        - Nếu tất cả QoS nằm trong safe -> thưởng tiết kiệm năng lượng, phạt nhẹ khi gần danger zone
-        - Không có phạt cứng cho violation; chỉ thưởng hướng cải thiện / phạt nhẹ hướng ra ngoài
+        Pure Lagrangian reward with dense signal:
+        - Objective: minimize total energy (or per-traffic energy)
+        - Constraint (QoS) handled externally by lambda update
         """
         if prev_state is None:
             return 0.0
 
         prev_state = np.array(prev_state).flatten()
         current_state = np.array(current_state).flatten()
-        action = np.array(action).flatten()
 
-        # indices
-        CELL_START_IDX = 17 + 14
+        NETWORK_START_IDX = 17  # adjust if different
+        idx_total_energy = NETWORK_START_IDX + 0   # totalEnergy
+
+        prev_energy = prev_state[idx_total_energy]
+        curr_energy = current_state[idx_total_energy]
+
+        energy_delta = curr_energy - prev_energy
+        energy_scale = config.get('energy_grad_coeff', 1000.0)
+        reward = -energy_scale * energy_delta / max(1e-6, prev_energy)
+
+
+        # Clip để tránh outlier
+        reward = np.clip(reward, -1000.0, 1000.0)
+
+        if env_id == 0 and np.random.random() < 1:
+            print(f"ΔEnergy={energy_delta:.4f}, Reward={reward:.4f}")
+
+        return float(reward)
+
+
+
+    def calculate_cost(self, current_state, env_id=0):
+        current_state = np.array(current_state).flatten()
+
         NETWORK_START_IDX = 17
+        CELL_START_IDX = 17 + 14
 
-        # network-level
-        prev_energy = prev_state[NETWORK_START_IDX + 0]
-        current_energy = current_state[NETWORK_START_IDX + 0]
-
-        prev_drop = prev_state[NETWORK_START_IDX + 2]
-        current_drop = current_state[NETWORK_START_IDX + 2]
-
-        prev_latency = prev_state[NETWORK_START_IDX + 3]
-        current_latency = current_state[NETWORK_START_IDX + 3]
-
+        drop = current_state[NETWORK_START_IDX + 2]
+        latency = current_state[NETWORK_START_IDX + 3]
         drop_th = current_state[11]
         latency_th = current_state[12]
         cpu_th = current_state[13]
         prb_th = current_state[14]
 
-        # per-cell maxima (current & prev)
         CPU_FEATURE_IDX = CELL_START_IDX
         PRB_FEATURE_IDX = CELL_START_IDX + self.n_cells
         max_cpu = np.max(current_state[CPU_FEATURE_IDX:CPU_FEATURE_IDX + self.n_cells])
         max_prb = np.max(current_state[PRB_FEATURE_IDX:PRB_FEATURE_IDX + self.n_cells])
-        prev_max_cpu = np.max(prev_state[CPU_FEATURE_IDX:CPU_FEATURE_IDX + self.n_cells])
-        prev_max_prb = np.max(prev_state[PRB_FEATURE_IDX:PRB_FEATURE_IDX + self.n_cells])
 
-        # gradients (positive when improve) - normalize by thresholds to be scenario-invariant
-        drop_grad = (prev_drop - current_drop) / max(1e-6, drop_th)
-        latency_grad = (prev_latency - current_latency) / max(1e-6, latency_th)
-        cpu_grad = (prev_max_cpu - max_cpu) / max(1e-6, cpu_th)
-        prb_grad = (prev_max_prb - max_prb) / max(1e-6, prb_th)
-        energy_grad = (prev_energy - current_energy) / max(1e-6, current_energy)
+        def strong_penalty(x, th, k=10.0):
+            v = max(0.0, (x - th) / max(1e-6, th))
+            return np.exp(k * v) - 1.0 if v > 0 else 0.0
 
-        # --- REWARD DECOMPOSITION ---
-        # reward khi prev hoặc current unsafe — tức khi agent đang/đã cải thiện từ trạng thái xấu
-        drop_improvement = config['qos_grad_coeff'] * drop_grad if (prev_drop >= drop_th or current_drop >= drop_th) else 0.0
-        latency_improvement = config['qos_grad_coeff'] * latency_grad if (prev_latency >= latency_th or current_latency >= latency_th) else 0.0
-        cpu_improvement = config['cpu_grad_coeff'] * cpu_grad if (prev_max_cpu > cpu_th or max_cpu > cpu_th) else 0.0
-        prb_improvement = config['prb_grad_coeff'] * prb_grad if (prev_max_prb > prb_th or max_prb > prb_th) else 0.0
+        drop_violation = strong_penalty(drop, drop_th)
+        latency_violation = strong_penalty(latency, latency_th)
+        cpu_violation = strong_penalty(max_cpu, cpu_th)
+        prb_violation = strong_penalty(max_prb, prb_th)
 
-        drop_improvement = np.clip(drop_improvement, -5.0, 5.0)
-        latency_improvement = np.clip(latency_improvement, -5.0, 5.0)
-        cpu_improvement = np.clip(cpu_improvement, -5.0, 5.0)
-        prb_improvement = np.clip(prb_improvement, -5.0, 5.0)
-
-        energy_efficiency_reward = 0.0
-        violation_penalty = 0.0
-
-        if (current_drop < drop_th) \
-            and (current_latency < latency_th) \
-            and (max_cpu <= cpu_th) \
-            and (max_prb <= prb_th):
-
-            # QoS safe → optimize energy
-            energy_efficiency_reward = config['energy_grad_coeff'] * energy_grad + config['baseline_reward']/2  
-            energy_efficiency_reward = np.clip(energy_efficiency_reward, -10.0, 30.0)
-                
-        # --- ABSOLUTE VIOLATION PENALTY (applies regardless of safe block) ---
-        # Penalize how far each QoS metric exceeds its threshold (normalized)
-        drop_violation = max(0.0, (current_drop - drop_th) / max(1e-6, drop_th))
-        latency_violation = max(0.0, (current_latency - latency_th) / max(1e-6, latency_th))
-        cpu_violation = max(0.0, (max_cpu - cpu_th) / max(1e-6, cpu_th))
-        prb_violation = max(0.0, (max_prb - prb_th) / max(1e-6, prb_th))
-        violation_penalty = drop_violation + latency_violation + cpu_violation + prb_violation 
-        violation_penalty = config['violation_penalty'] * violation_penalty
-
-        if prev_drop >= drop_th or current_drop >= drop_th:
-            violation_penalty -= config['baseline_reward']
-        if prev_latency >= latency_th or current_latency >= latency_th:
-            violation_penalty -= config['baseline_reward']
-        if prev_max_cpu > cpu_th or max_cpu > cpu_th:
-            violation_penalty -= config['baseline_reward']
-        if prev_max_prb > prb_th or max_prb > prb_th:
-            violation_penalty -= config['baseline_reward']
-            
-        violation_penalty = np.clip(violation_penalty, -50.0, 0.0)
-        
-        # --- TOTAL REWARD ---
-        total_reward = (
-            drop_improvement
-            + latency_improvement
-            + cpu_improvement
-            + prb_improvement
-            + energy_efficiency_reward
-            + violation_penalty 
+        qos_cost = (
+            config.get('drop_cost_coeff', 1.0) * drop_violation +
+            config.get('latency_cost_coeff', 1.0) * latency_violation +
+            config.get('cpu_cost_coeff', 1.0) * cpu_violation +
+            config.get('prb_cost_coeff', 1.0) * prb_violation
         )
 
-        # Scale reward to a consistent range across scenarios
-        if self.use_reward_tanh_scale and self.reward_tanh_scale > 0:
-            total_reward = float(np.tanh(total_reward / self.reward_tanh_scale) * self.reward_tanh_scale)
+        qos_cost = np.clip(qos_cost, 0.0, 1000.0)
 
-        # Online reward normalization (optional)
-        if self.use_reward_running_norm:
-            total_reward = float(self.normalize_reward(total_reward))
+        if env_id == 0 and np.random.random() < 1:
+            print(f"qos_cost: {qos_cost:.4f}")
+            print(f"drop_vio={drop_violation:.4f}, lat_vio={latency_violation:.4f}, "
+                f"cpu_vio={cpu_violation:.4f}, prb_vio={prb_violation:.4f}")
 
-        if env_id == 0:
-            # --- METRICS LOGGING ---
-            if np.random.random() < 0.02:
-                print("total_reward: ", f"{total_reward:.5f}", 
-                    "\ndrop_improvement: ", f"{drop_improvement:.5f}", 
-                    "\nlatency_improvement: ", f"{latency_improvement:.5f}", 
-                    "\ncpu_improvement: ", f"{cpu_improvement:.5f}", 
-                    "\nprb_improvement: ", f"{prb_improvement:.5f}", 
-                    "\nenergy_efficiency_reward: ", f"{energy_efficiency_reward:.5f}", 
-                    "\nviolation_penalty: ", f"{violation_penalty:.5f}", 
-                    "\nenergy_grad: ", f"{energy_grad:.5f}"
-                )
-                self.metrics['drop_rate'].append(current_drop)
-                self.metrics['latency'].append(current_latency)
-                self.metrics['cpu'].append(max_cpu)
-                self.metrics['prb'].append(max_prb)
-                self.metrics['energy_efficiency_reward'].append(energy_efficiency_reward)
-                self.metrics['drop_improvement'].append(drop_improvement)
-                self.metrics['latency_improvement'].append(latency_improvement)
-                self.metrics['cpu_improvement'].append(cpu_improvement)
-                self.metrics['prb_improvement'].append(prb_improvement)
-                self.metrics['violation_penalty'].append(violation_penalty)
-                self.metrics['total_reward'].append(total_reward)
+        return float(qos_cost)
 
-        return float(np.clip(total_reward, -100.0, 100.0))
-    
+
     # NOT REMOVED FOR INTERACTING WITH SIMULATION (CAN BE MODIFIED)
     def update(self, state, action, next_state, done, env_id=0):
         """
@@ -631,8 +569,9 @@ class RLAgent:
         
         action = self.current_padded_actions.get(env_id, np.ones(self.max_cells) * 0.7)
         
-        # Calculate actual reward using state as prev_state and next_state as current
+        # Calculate actual reward and cost using state as prev_state and next_state as current
         actual_reward = self.calculate_reward(state, action, next_state, env_id)
+        actual_cost = self.calculate_cost(next_state, env_id)
         
         # Convert inputs to numpy if needed
         if hasattr(state, 'numpy'):
@@ -666,6 +605,7 @@ class RLAgent:
             state=state,
             action=action,
             reward=actual_reward,
+            cost=actual_cost,
             next_state=next_state_aug,
             done=done,
             log_prob=self.last_log_probs.get(env_id, 0.0),
@@ -693,13 +633,14 @@ class RLAgent:
             return
 
         # Fetch and clear buffer
-        states, actions, rewards, next_states, dones, old_log_probs, values, env_ids = self.buffer.get_all_and_clear()
+        states, actions, rewards, costs, next_states, dones, old_log_probs, values, env_ids = self.buffer.get_all_and_clear()
 
         # convert lists -> numpy arrays / tensors
         states = np.asarray(states, dtype=np.float32)
         actions = np.asarray(actions, dtype=np.float32)
         rewards = np.asarray(rewards, dtype=np.float32)
         next_states = np.asarray(next_states, dtype=np.float32)
+        costs = np.asarray(costs, dtype=np.float32)
         dones = np.asarray(dones, dtype=np.float32)
         old_log_probs = np.asarray(old_log_probs, dtype=np.float32)
         values = np.asarray(values, dtype=np.float32)
@@ -707,6 +648,7 @@ class RLAgent:
 
         # To tensors
         rewards_tensor = torch.FloatTensor(rewards).to(self.device)
+        costs_tensor = torch.FloatTensor(costs).to(self.device)
         values_tensor = torch.FloatTensor(values).to(self.device)
         dones_tensor = torch.FloatTensor(dones).to(self.device)
         env_ids_np = np.array(env_ids)
@@ -715,6 +657,13 @@ class RLAgent:
         unique_envs = np.unique(env_ids_np)
         all_advantages = torch.zeros_like(rewards_tensor)
         all_returns = torch.zeros_like(values_tensor)
+        all_cost_advantages = torch.zeros_like(costs_tensor)
+        all_cost_returns = torch.zeros_like(costs_tensor)
+
+        # Precompute cost value predictions with no grad for all states (targets)
+        states_tensor_full = torch.FloatTensor(states).to(self.device)
+        with torch.no_grad():
+            cost_values_full = self.cost_critic(states_tensor_full).squeeze()
 
         for env_id in unique_envs:
             env_mask = (env_ids_np == env_id)
@@ -731,9 +680,12 @@ class RLAgent:
             last_state = torch.FloatTensor(bootstrap_input).unsqueeze(0).to(self.device)
             with torch.no_grad():
                 next_value = self.critic(last_state).squeeze()
+                next_cost_value = self.cost_critic(last_state).squeeze()
 
             advantages = torch.zeros_like(env_rewards)
+            cost_advantages = torch.zeros_like(costs_tensor[env_mask])
             last_adv = 0.0
+            last_cost_adv = 0.0
             # Append next_value conceptually by indexing t+1 at end
             for t in reversed(range(len(env_rewards))):
                 non_terminal = 1.0 - env_dones[t]
@@ -741,10 +693,19 @@ class RLAgent:
                 delta = env_rewards[t] + self.gamma * nv * non_terminal - env_values[t]
                 last_adv = delta + self.gamma * self.lambda_gae * non_terminal * last_adv
                 advantages[t] = last_adv
+                # Cost side GAE
+                cv_t = cost_values_full[env_indices[t]]
+                nv_c = next_cost_value if t == len(env_rewards) - 1 else cost_values_full[env_indices[t + 1]]
+                delta_c = costs_tensor[env_mask][t] + self.gamma * nv_c * non_terminal - cv_t
+                last_cost_adv = delta_c + self.gamma * self.lambda_gae * non_terminal * last_cost_adv
+                cost_advantages[t] = last_cost_adv
 
             returns = advantages + env_values
             all_advantages[env_mask] = advantages
             all_returns[env_mask] = returns
+            cost_returns = cost_advantages + cost_values_full[env_mask]
+            all_cost_advantages[env_mask] = cost_advantages
+            all_cost_returns[env_mask] = cost_returns
 
         # Dataset tensors
         states_tensor = torch.FloatTensor(states).to(self.device)
@@ -752,24 +713,35 @@ class RLAgent:
         old_log_probs_tensor = torch.FloatTensor(old_log_probs).to(self.device)
         advantages_tensor = all_advantages
         returns_tensor = all_returns
+        cost_advantages_tensor = all_cost_advantages
+        cost_returns_tensor = all_cost_returns
 
         # Normalize advantages
         if len(advantages_tensor) > 1:
             advantages_tensor = (advantages_tensor - advantages_tensor.mean()) / (advantages_tensor.std() + 1e-8)
         else:
             advantages_tensor = advantages_tensor - advantages_tensor.mean()
+        if len(cost_advantages_tensor) > 1:
+            cost_advantages_tensor = (cost_advantages_tensor - cost_advantages_tensor.mean()) / (cost_advantages_tensor.std() + 1e-8)
+        else:
+            cost_advantages_tensor = cost_advantages_tensor - cost_advantages_tensor.mean()
 
         dataset = torch.utils.data.TensorDataset(
-            states_tensor, actions_tensor, old_log_probs_tensor, advantages_tensor, returns_tensor
+            states_tensor, actions_tensor, old_log_probs_tensor, advantages_tensor, returns_tensor,
+            cost_advantages_tensor, cost_returns_tensor
         )
         loader = torch.utils.data.DataLoader(dataset, batch_size=self.batch_size, shuffle=True)
 
         final_entropy = 0.0
         final_actor_loss = 0.0
         final_critic_loss = 0.0
+        final_cost_critic_loss = 0.0
 
         for epoch in range(self.ppo_epochs):
-            for batch_states, batch_actions, batch_old_log_probs, batch_advantages, batch_returns in loader:
+            for batch in loader:
+                (batch_states, batch_actions, batch_old_log_probs,
+                 batch_advantages, batch_returns,
+                 batch_cost_advantages, batch_cost_returns) = batch
                 action_mean, action_logstd = self.actor(batch_states)
                 action_std = torch.exp(action_logstd)
                 dist = torch.distributions.Normal(action_mean, action_std)
@@ -780,13 +752,23 @@ class RLAgent:
                 entropy = dist.entropy()[:, :n].sum(-1).mean()
 
                 ratio = torch.exp(new_log_probs - batch_old_log_probs)
-                surr1 = ratio * batch_advantages
-                surr2 = torch.clamp(ratio, 1 - self.clip_epsilon, 1 + self.clip_epsilon) * batch_advantages
-                # Add entropy bonus to encourage exploration
-                actor_loss = -torch.min(surr1, surr2).mean() - self.entropy_coef * entropy
+                # Reward surrogate
+                surr1_r = ratio * batch_advantages
+                surr2_r = torch.clamp(ratio, 1 - self.clip_epsilon, 1 + self.clip_epsilon) * batch_advantages
+                L_reward = torch.min(surr1_r, surr2_r).mean()
+                # Cost surrogate
+                surr1_c = ratio * batch_cost_advantages
+                surr2_c = torch.clamp(ratio, 1 - self.clip_epsilon, 1 + self.clip_epsilon) * batch_cost_advantages
+                L_cost = torch.min(surr1_c, surr2_c).mean()
+                # Lagrangian objective (maximize reward, minimize cost)
+                lagrange = torch.clamp(torch.tensor(self.lambda_multiplier, device=self.device), 0.0, self.lambda_max)
+                actor_loss = -(L_reward - lagrange * L_cost) - self.entropy_coef * entropy
 
                 current_values = self.critic(batch_states).squeeze()
-                critic_loss = nn.MSELoss()(current_values, batch_returns)
+                critic_loss = nn.MSELoss()(current_values, batch_returns.detach())
+                # Cost critic loss
+                current_cost_values = self.cost_critic(batch_states).squeeze()
+                cost_critic_loss = nn.MSELoss()(current_cost_values, batch_cost_returns.detach())
 
                 self.actor_optimizer.zero_grad()
                 actor_loss.backward()
@@ -798,14 +780,44 @@ class RLAgent:
                 torch.nn.utils.clip_grad_norm_(self.critic.parameters(), 0.5)
                 self.critic_optimizer.step()
 
+                self.cost_critic_optimizer.zero_grad()
+                cost_critic_loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.cost_critic.parameters(), 0.5)
+                self.cost_critic_optimizer.step()
+
                 final_entropy = entropy.item()
                 final_actor_loss = actor_loss.item()
                 final_critic_loss = critic_loss.item()
+                final_cost_critic_loss = cost_critic_loss.item()
 
+        # Dual ascent update for lambda (compute per-env mean cost (proxy for episodic cost))
+        env_cost_means = []
+        for env_id in unique_envs:
+            env_mask = (env_ids_np == env_id)
+            if env_mask.sum() == 0:
+                continue
+            env_cost = costs[env_mask]  # costs is numpy array earlier
+            env_cost_means.append(float(np.mean(env_cost)))
+        if len(env_cost_means) == 0:
+            J_c = 0.0
+        else:
+            J_c = float(np.mean(env_cost_means))
+        self.lambda_multiplier = float(np.clip(self.lambda_multiplier + self.lambda_lr * (J_c - self.cost_target), 0.0, self.lambda_max))
+        
+        # Mean reward across buffer
+        J_r = float(np.mean(rewards)) if len(rewards) > 0 else 0.0
+
+        self.metrics['lambda'].append(self.lambda_multiplier)
+        self.metrics['reward'].append(J_r)
+        self.metrics['cost'].append(J_c)
         self.metrics['entropy'].append(final_entropy)
         self.metrics['actor_loss'].append(final_actor_loss)
         self.metrics['critic_loss'].append(final_critic_loss)
-        self.logger.info(f"Training completed: Actor loss={final_actor_loss:.4f}, Critic loss={final_critic_loss:.4f}, Entropy={final_entropy:.4f}")
+        self.metrics['cost_critic_loss'].append(final_cost_critic_loss)
+        self.logger.info(
+            f"Train: J_r={J_r:.4f}, J_c={J_c:.4f}, lambda={self.lambda_multiplier:.4f}, "
+            f"actor={final_actor_loss:.4f}, critic={final_critic_loss:.4f}, cost_critic={final_cost_critic_loss:.4f}, ent={final_entropy:.4f}"
+        )
 
     
     def save_model(self, filepath=None):
@@ -823,9 +835,12 @@ class RLAgent:
         checkpoint = {
             'actor_state_dict': self.actor.state_dict(),
             'critic_state_dict': self.critic.state_dict(),
+            'cost_critic_state_dict': self.cost_critic.state_dict(),
             'actor_optimizer_state_dict': self.actor_optimizer.state_dict(),
             'critic_optimizer_state_dict': self.critic_optimizer.state_dict(),
+            'cost_critic_optimizer_state_dict': self.cost_critic_optimizer.state_dict(),
             'episodes_trained': self.total_episodes,
+            'lambda_multiplier': self.lambda_multiplier,
         }
         
         torch.save(checkpoint, filepath)
@@ -837,12 +852,18 @@ class RLAgent:
         
         self.actor.load_state_dict(checkpoint['actor_state_dict'])
         self.critic.load_state_dict(checkpoint['critic_state_dict'])
+        if 'cost_critic_state_dict' in checkpoint:
+            self.cost_critic.load_state_dict(checkpoint['cost_critic_state_dict'])
         self.actor_optimizer.load_state_dict(checkpoint['actor_optimizer_state_dict'])
         self.critic_optimizer.load_state_dict(checkpoint['critic_optimizer_state_dict'])
+        if 'cost_critic_optimizer_state_dict' in checkpoint:
+            self.cost_critic_optimizer.load_state_dict(checkpoint['cost_critic_optimizer_state_dict'])
         if self.training_mode:
             self.current_episode = checkpoint['episodes_trained'] + 1
             self.total_episodes = checkpoint['episodes_trained'] + self.total_episodes
             print(f"current_episode: {self.current_episode}, total_episodes: {self.total_episodes}")
+        if 'lambda_multiplier' in checkpoint:
+            self.lambda_multiplier = float(checkpoint['lambda_multiplier'])
         
         self.logger.info(f"Model loaded from {filepath}")
     
@@ -854,146 +875,84 @@ class RLAgent:
         self.logger.info(f"Training mode set to {training}")
     
     def save_plots(self):
-        """Save comprehensive metrics plots showing all reward components"""
+        """Save concise Lagrangian PPO metrics plots."""
         if not any(self.metrics.values()):
             return
-        
-        def ma(data, window=20):
-            if len(data) < window: return data
+
+        def ma(data, window=10):
+            if len(data) < window:
+                return data
             return np.convolve(data, np.ones(window)/window, mode='valid')
-        
-        # Create a larger figure with more subplots for comprehensive view
-        fig, axes = plt.subplots(3, 3, figsize=(18, 12))
-        fig.suptitle(f'Episode {self.total_episodes} - Comprehensive Metrics Dashboard', fontsize=16)
-        
-        # 1. QoS Improvement Rewards (top-left)
-        if any([self.metrics['drop_improvement'], self.metrics['latency_improvement'], 
-                self.metrics['cpu_improvement'], self.metrics['prb_improvement']]):
-            if self.metrics['drop_improvement']:
-                axes[0,0].plot(ma(self.metrics['drop_improvement']), label='Drop Improvement', linewidth=2)
-            if self.metrics['latency_improvement']:
-                axes[0,0].plot(ma(self.metrics['latency_improvement']), label='Latency Improvement', linewidth=2)
-            if self.metrics['cpu_improvement']:
-                axes[0,0].plot(ma(self.metrics['cpu_improvement']), label='CPU Improvement', linewidth=2)
-            if self.metrics['prb_improvement']:
-                axes[0,0].plot(ma(self.metrics['prb_improvement']), label='PRB Improvement', linewidth=2)
-            axes[0,0].set_title('QoS Improvement Rewards')
-            axes[0,0].set_ylabel('Reward Value')
-            axes[0,0].legend(fontsize=8)
+
+        fig, axes = plt.subplots(2, 3, figsize=(16, 8))
+        fig.suptitle(f'Episode {self.total_episodes} - Lagrangian PPO Metrics', fontsize=16)
+
+        # Reward
+        if self.metrics['reward']:
+            axes[0,0].plot(self.metrics['reward'], alpha=0.4, label='Reward')
+            if len(self.metrics['reward']) >= 5:
+                axes[0,0].plot(ma(self.metrics['reward']), label='Reward MA', linewidth=2)
+            axes[0,0].set_title('Mean Reward per Update')
             axes[0,0].grid(True, alpha=0.3)
-        
-        # 2. Energy & Efficiency Rewards (top-center)
-        if self.metrics['energy_efficiency_reward']:
-            axes[0,1].plot(ma(self.metrics['energy_efficiency_reward']), label='Energy Efficiency', linewidth=2, color='green')
-            axes[0,1].set_title('Energy-Related Rewards')
-            axes[0,1].set_ylabel('Reward Value')
-            axes[0,1].legend(fontsize=8)
+            axes[0,0].legend(fontsize=8)
+
+        # Cost
+        if self.metrics['cost']:
+            axes[0,1].plot(self.metrics['cost'], alpha=0.4, label='Cost', color='red')
+            if len(self.metrics['cost']) >= 5:
+                axes[0,1].plot(ma(self.metrics['cost']), label='Cost MA', linewidth=2, color='darkred')
+            # Draw target line
+            axes[0,1].axhline(self.cost_target, color='gray', linestyle='--', linewidth=1, label='Cost Target')
+            axes[0,1].set_title('Mean Cost per Update')
             axes[0,1].grid(True, alpha=0.3)
-        
-        # 3. Penalty Components (top-right)
-        if any([self.metrics['violation_penalty']]):
-            if self.metrics['violation_penalty']:
-                axes[0,2].plot(ma(self.metrics['violation_penalty']), label='Violation Penalty', linewidth=2, color='red')
-            axes[0,2].set_title('Penalty & Warning Components')
-            axes[0,2].set_ylabel('Penalty/Reward Value')
-            axes[0,2].legend(fontsize=8)
+            axes[0,1].legend(fontsize=8)
+
+        # Lambda
+        if self.metrics['lambda']:
+            axes[0,2].plot(self.metrics['lambda'], label='Lambda', color='purple')
+            axes[0,2].set_title('Lagrange Multiplier λ')
             axes[0,2].grid(True, alpha=0.3)
-        
-        # 4. Total Reward (middle-left)
-        if self.metrics['total_reward']:
-            axes[1,0].plot(self.metrics['total_reward'], alpha=0.3, color='blue')
-            axes[1,0].plot(ma(self.metrics['total_reward']), linewidth=2, color='darkblue', label='Total Reward MA')
-            axes[1,0].set_title('Total Reward')
-            axes[1,0].set_ylabel('Total Reward')
-            axes[1,0].legend(fontsize=8)
-            axes[1,0].grid(True, alpha=0.3)
-        
-        # 5. QoS Metrics (middle-center)
-        if any([self.metrics['drop_rate'], self.metrics['latency'], self.metrics['cpu'], self.metrics['prb']]):
-            if self.metrics['drop_rate']:
-                axes[1,1].plot(ma(self.metrics['drop_rate']), label='Drop Rate (%)', linewidth=2)
-            if self.metrics['latency']:
-                # Normalize latency for better visualization
-                latency_norm = np.array(self.metrics['latency']) / 100  # Scale down for visualization
-                axes[1,1].plot(ma(latency_norm), label='Latency (ms/100)', linewidth=2)
-            if self.metrics['cpu']:
-                axes[1,1].plot(ma(self.metrics['cpu']), label='Max CPU (%)', linewidth=2)
-            if self.metrics['prb']:
-                axes[1,1].plot(ma(self.metrics['prb']), label='Max PRB (%)', linewidth=2)
-            axes[1,1].set_title('QoS Metrics')
-            axes[1,1].set_ylabel('Metric Value')
-            axes[1,1].legend(fontsize=8)
-            axes[1,1].grid(True, alpha=0.3)
-        
-        # 6. Training Metrics (middle-right)
-        if any([self.metrics['actor_loss'], self.metrics['critic_loss'], self.metrics['entropy']]):
+            axes[0,2].legend(fontsize=8)
+
+        # Losses
+        has_losses = any([
+            len(self.metrics['actor_loss']) > 0,
+            len(self.metrics['critic_loss']) > 0,
+            len(self.metrics['cost_critic_loss']) > 0
+        ])
+        if has_losses:
             if self.metrics['actor_loss']:
-                axes[1,2].plot(self.metrics['actor_loss'], alpha=0.3, label='Actor Loss', color='red')
-                if len(self.metrics['actor_loss']) >= 5:
-                    axes[1,2].plot(ma(self.metrics['actor_loss'], 5), label='Actor Loss MA', linewidth=2, color='darkred')
+                axes[1,0].plot(self.metrics['actor_loss'], alpha=0.4, label='Actor')
             if self.metrics['critic_loss']:
-                axes[1,2].plot(self.metrics['critic_loss'], alpha=0.3, label='Critic Loss', color='blue')
-                if len(self.metrics['critic_loss']) >= 5:
-                    axes[1,2].plot(ma(self.metrics['critic_loss'], 5), label='Critic Loss MA', linewidth=2, color='darkblue')
-            axes[1,2].set_title('Training Losses')
-            axes[1,2].set_ylabel('Loss Value')
-            axes[1,2].legend(fontsize=8)
-            axes[1,2].grid(True, alpha=0.3)
-        
-        # 7. Entropy (bottom-left)
+                axes[1,0].plot(self.metrics['critic_loss'], alpha=0.4, label='Critic')
+            if self.metrics['cost_critic_loss']:
+                axes[1,0].plot(self.metrics['cost_critic_loss'], alpha=0.4, label='Cost Critic')
+            axes[1,0].set_title('Losses')
+            axes[1,0].grid(True, alpha=0.3)
+            axes[1,0].legend(fontsize=8)
+
+        # Entropy
         if self.metrics['entropy']:
-            axes[2,0].plot(self.metrics['entropy'], alpha=0.3, label='Entropy', color='purple')
-            axes[2,0].plot(ma(self.metrics['entropy']), label='Entropy MA', linewidth=2, color='darkmagenta')
-            axes[2,0].set_title('Policy Entropy')
-            axes[2,0].set_ylabel('Entropy')
-            axes[2,0].set_xlabel('Training Step')
-            axes[2,0].legend(fontsize=8)
-            axes[2,0].grid(True, alpha=0.3)
-        
-        # 8. Reward Components Stacked (bottom-center)
-        if any([self.metrics['energy_efficiency_reward'], self.metrics['drop_improvement'], 
-                self.metrics['violation_penalty']]):
-            reward_components = []
-            labels = []
-            colors = []
-            
-            if self.metrics['energy_efficiency_reward']:
-                reward_components.append(ma(self.metrics['energy_efficiency_reward']))
-                labels.append('Energy Efficiency')
-                colors.append('green')
-            if self.metrics['drop_improvement']:
-                reward_components.append(ma(self.metrics['drop_improvement']))
-                labels.append('Drop Improvement')
-                colors.append('blue')
-            if self.metrics['violation_penalty']:
-                reward_components.append(ma(self.metrics['violation_penalty']))
-                labels.append('Violation Penalty')
-                colors.append('red')
-            
-            # Stack the components
-            if reward_components:
-                axes[2,1].stackplot(range(len(reward_components[0])), *reward_components, 
-                                  labels=labels, colors=colors, alpha=0.7)
-                axes[2,1].set_title('Reward Components (Stacked)')
-                axes[2,1].set_ylabel('Cumulative Reward')
-                axes[2,1].set_xlabel('Step')
-                axes[2,1].legend(fontsize=8, loc='upper left')
-                axes[2,1].grid(True, alpha=0.3)
-        
-        # 9. Reward Distribution (bottom-right)
-        if self.metrics['total_reward']:
-            axes[2,2].hist(self.metrics['total_reward'], bins=30, alpha=0.7, color='skyblue', edgecolor='black')
-            axes[2,2].axvline(np.mean(self.metrics['total_reward']), color='red', linestyle='--', 
-                            label=f'Mean: {np.mean(self.metrics["total_reward"]):.2f}')
-            axes[2,2].set_title('Total Reward Distribution')
-            axes[2,2].set_xlabel('Reward Value')
-            axes[2,2].set_ylabel('Frequency')
-            axes[2,2].legend(fontsize=8)
-            axes[2,2].grid(True, alpha=0.3)
-        
+            axes[1,1].plot(self.metrics['entropy'], alpha=0.4, label='Entropy', color='teal')
+            if len(self.metrics['entropy']) >= 5:
+                axes[1,1].plot(ma(self.metrics['entropy']), label='Entropy MA', linewidth=2, color='darkcyan')
+            axes[1,1].set_title('Policy Entropy')
+            axes[1,1].grid(True, alpha=0.3)
+            axes[1,1].legend(fontsize=8)
+
+        # Hide last subplot if unused
+        axes[1,2].axis('off')
+
         plt.tight_layout()
         os.makedirs('plots', exist_ok=True)
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        plt.savefig(f'plots/comprehensive_metrics_{timestamp}.png', dpi=300, bbox_inches='tight')
+        
+        # Extract model name from checkpoint_save_path
+        model_name = ""
+        if self.checkpoint_save_path and self.checkpoint_save_path.endswith('.pth'):
+            model_name = os.path.splitext(os.path.basename(self.checkpoint_save_path))[0]
+        
+        out_path = f'plots/{model_name}_{timestamp}.png'
+        plt.savefig(out_path, dpi=300, bbox_inches='tight')
         plt.close()
-        self.logger.info(f"Comprehensive plots saved to plots/comprehensive_metrics_{timestamp}.png")
+        self.logger.info(f"Metrics plot saved to {out_path}")

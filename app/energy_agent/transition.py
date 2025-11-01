@@ -2,9 +2,9 @@
 import numpy as np
 from collections import namedtuple
 
-# Transition includes next_state and env_id
+# Transition includes next_state, env_id, and per-step cost (for Lagrangian PPO)
 Transition = namedtuple('Transition', [
-    'state', 'action', 'reward', 'next_state', 'done', 'log_prob', 'value', 'env_id'
+    'state', 'action', 'reward', 'cost', 'next_state', 'done', 'log_prob', 'value', 'env_id'
 ])
 
 class TrajectoryBuffer:
@@ -26,18 +26,19 @@ class TrajectoryBuffer:
         self.memory = []
 
         if len(batch) == 0:
-            return [], [], [], [], [], [], [], []
+            return [], [], [], [], [], [], [], [], []
 
         states = [t.state for t in batch]
         actions = [t.action for t in batch]
         rewards = [t.reward for t in batch]
+        costs = [t.cost for t in batch]
         next_states = [t.next_state for t in batch]
         dones = [t.done for t in batch]
         log_probs = [t.log_prob for t in batch]
         values = [t.value for t in batch]
         env_ids = [t.env_id for t in batch]
 
-        return states, actions, rewards, next_states, dones, log_probs, values, env_ids
+        return states, actions, rewards, costs, next_states, dones, log_probs, values, env_ids
 
     def __len__(self):
         return len(self.memory)
