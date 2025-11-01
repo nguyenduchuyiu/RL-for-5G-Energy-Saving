@@ -526,14 +526,13 @@ class RLAgent:
         max_cpu = np.max(current_state[CPU_FEATURE_IDX:CPU_FEATURE_IDX + self.n_cells])
         max_prb = np.max(current_state[PRB_FEATURE_IDX:PRB_FEATURE_IDX + self.n_cells])
 
-        def strong_penalty(x, th, k=10.0):
-            v = max(0.0, (x - th) / max(1e-6, th))
-            return np.exp(k * v) - 1.0 if v > 0 else 0.0
+        def _violation_penalty(x, th):
+            return max(0.0, (x - th) / max(1e-6, th))
 
-        drop_violation = strong_penalty(drop, drop_th)
-        latency_violation = strong_penalty(latency, latency_th)
-        cpu_violation = strong_penalty(max_cpu, cpu_th)
-        prb_violation = strong_penalty(max_prb, prb_th)
+        drop_violation = _violation_penalty(drop, drop_th)
+        latency_violation = _violation_penalty(latency, latency_th)
+        cpu_violation = _violation_penalty(max_cpu, cpu_th)
+        prb_violation = _violation_penalty(max_prb, prb_th)
 
         qos_cost = (
             config.get('drop_cost_coeff', 1.0) * drop_violation +
