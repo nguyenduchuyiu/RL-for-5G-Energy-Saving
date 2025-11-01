@@ -559,13 +559,13 @@ class RLAgent:
         violation_penalty = drop_violation + latency_violation + cpu_violation + prb_violation 
         violation_penalty = config['violation_penalty'] * violation_penalty
 
-        if prev_drop > drop_th or current_drop > drop_th:
+        if prev_drop >= drop_th or current_drop >= drop_th:
             violation_penalty -= config['baseline_reward']
-        if prev_latency > latency_th or current_latency > latency_th:
+        if prev_latency >= latency_th or current_latency >= latency_th:
             violation_penalty -= config['baseline_reward']
-        if prev_max_cpu > cpu_th or max_cpu > cpu_th:
+        if prev_max_cpu >= cpu_th or max_cpu >= cpu_th:
             violation_penalty -= config['baseline_reward']
-        if prev_max_prb > prb_th or max_prb > prb_th:
+        if prev_max_prb >= prb_th or max_prb >= prb_th:
             violation_penalty -= config['baseline_reward']
             
         violation_penalty = np.clip(violation_penalty, -50.0, 0.0)
