@@ -1,8 +1,8 @@
 training_mode: False
 use_gpu: False
 
-checkpoint_load_path: "models/ppo_model_dense_urban_rural.pth"
-checkpoint_save_path: "models/ppo_model_dense_urban_rural_high_speed.pth"
+checkpoint_load_path: "models/du32_r64.pth"
+checkpoint_save_path: "models/du32_r961.pth"
 
 actor_lr: 0.00003
 critic_lr: 0.0001
@@ -13,6 +13,9 @@ cpu_grad_coeff: 1.0
 prb_grad_coeff: 1.0
 violation_penalty: -50.0
 baseline_reward: 10.0
+use_reward_tanh_scale: False
+reward_tanh_scale: 20.0
+use_reward_running_norm: False
 
 entropy_coef: 0.01
 gamma: 0.99
