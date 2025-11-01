@@ -528,8 +528,8 @@ class RLAgent:
 
         # --- REWARD DECOMPOSITION ---
         # reward khi prev hoặc current unsafe — tức khi agent đang/đã cải thiện từ trạng thái xấu
-        drop_improvement = config['qos_grad_coeff'] * drop_grad if (prev_drop > drop_th or current_drop > drop_th) else 0.0
-        latency_improvement = config['qos_grad_coeff'] * latency_grad if (prev_latency > latency_th or current_latency > latency_th) else 0.0
+        drop_improvement = config['qos_grad_coeff'] * drop_grad if (prev_drop >= drop_th or current_drop >= drop_th) else 0.0
+        latency_improvement = config['qos_grad_coeff'] * latency_grad if (prev_latency >= latency_th or current_latency >= latency_th) else 0.0
         cpu_improvement = config['cpu_grad_coeff'] * cpu_grad if (prev_max_cpu > cpu_th or max_cpu > cpu_th) else 0.0
         prb_improvement = config['prb_grad_coeff'] * prb_grad if (prev_max_prb > prb_th or max_prb > prb_th) else 0.0
 
@@ -543,8 +543,8 @@ class RLAgent:
 
         if (current_drop < drop_th) \
             and (current_latency < latency_th) \
-            and (max_cpu < cpu_th) \
-            and (max_prb < prb_th):
+            and (max_cpu <= cpu_th) \
+            and (max_prb <= prb_th):
 
             # QoS safe → optimize energy
             energy_efficiency_reward = config['energy_grad_coeff'] * energy_grad + config['baseline_reward']/2  
@@ -563,9 +563,9 @@ class RLAgent:
             violation_penalty -= config['baseline_reward']
         if prev_latency >= latency_th or current_latency >= latency_th:
             violation_penalty -= config['baseline_reward']
-        if prev_max_cpu >= cpu_th or max_cpu >= cpu_th:
+        if prev_max_cpu > cpu_th or max_cpu > cpu_th:
             violation_penalty -= config['baseline_reward']
-        if prev_max_prb >= prb_th or max_prb >= prb_th:
+        if prev_max_prb > prb_th or max_prb > prb_th:
             violation_penalty -= config['baseline_reward']
             
         violation_penalty = np.clip(violation_penalty, -50.0, 0.0)
