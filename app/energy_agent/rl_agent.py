@@ -501,7 +501,7 @@ class RLAgent:
         # Clip để tránh outlier
         reward = np.clip(reward, -1000.0, 1000.0)
 
-        if env_id == 0 and np.random.random() < 1:
+        if env_id == 0 and np.random.random() < 0.02:
             print(f"ΔEnergy={energy_delta:.4f}, Reward={reward:.4f}")
 
         return float(reward)
@@ -544,7 +544,7 @@ class RLAgent:
 
         qos_cost = np.clip(qos_cost, 0.0, 1000.0)
 
-        if env_id == 0 and np.random.random() < 1:
+        if env_id == 0 and np.random.random() < 0.02:
             print(f"qos_cost: {qos_cost:.4f}")
             print(f"drop_vio={drop_violation:.4f}, lat_vio={latency_violation:.4f}, "
                 f"cpu_vio={cpu_violation:.4f}, prb_vio={prb_violation:.4f}")
