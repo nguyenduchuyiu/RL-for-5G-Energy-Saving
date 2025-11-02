@@ -1,13 +1,13 @@
 training_mode: True
 use_gpu: False
 
-checkpoint_load_path: "models/du32.pth"
-checkpoint_save_path: "models/ppo_test.pth"
+checkpoint_load_path: "models/zero.pth"
+checkpoint_save_path: "models/um.pth"
 
-actor_lr: 0.00003
-critic_lr: 0.0001
+actor_lr: 0.0003
+critic_lr: 0.001
 
-energy_grad_coeff: 10000.0
+energy_grad_coeff: 1000.0
 drop_cost_coeff: 10.0
 latency_cost_coeff: 10.0
 cpu_cost_coeff: 10.0
@@ -19,13 +19,13 @@ lambda_gae: 0.95
 clip_epsilon: 0.2
 ppo_epochs: 8
 batch_size: 4
-buffer_size: 4
+buffer_size: 2048
 n_envs: 4
 hidden_dim: 256
 
 # Lagrangian PPO settings
 lambda_init: 1.0
-lambda_lr: 0.001
+lambda_lr: 0.01
 lambda_max: 10.0
 # Target average cost per step (set per-scenario scale). 0 encourages constraint satisfaction.
 cost_target: 0.0

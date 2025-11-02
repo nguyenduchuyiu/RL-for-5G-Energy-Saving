@@ -527,7 +527,8 @@ class RLAgent:
         max_prb = np.max(current_state[PRB_FEATURE_IDX:PRB_FEATURE_IDX + self.n_cells])
 
         def _violation_penalty(x, th):
-            return max(0.0, (x - th) / max(1e-6, th))
+            violation_ratio = max(0.0, (x - th) / max(1e-6, th))
+            return violation_ratio ** 3
 
         drop_violation = _violation_penalty(drop, drop_th)
         latency_violation = _violation_penalty(latency, latency_th)
