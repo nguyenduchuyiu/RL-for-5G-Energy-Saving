@@ -418,81 +418,93 @@ class RLAgent:
     # NOT REMOVED FOR INTERACTING WITH SIMULATION (CAN BE MODIFIED)
     def get_action(self, state, env_id=0):
         """
-        Get action from policy network
-        
-        Args:
-            state: State vector from MATLAB interface
-            env_id: Environment id for parallel execution
-            
-        Returns:
-            action: Power ratios for each cell [0, 1]
+        Get action from policy network.
+        Correctly computes log_prob *after* forcing/clamping actions.
         """
 
+        if self.current_episode <= 1 and self.training_mode: # Chỉ warmup khi training
+            print("Warmup episode, returning fixed action")
+            action_val = 0.7
+            action_np = np.ones(self.max_cells) * action_val
+            
+            # Cập nhật action đã thực thi (Phần này bạn đã sửa đúng)
+            self.current_padded_actions[env_id] = action_np
+            self.last_log_probs[env_id] = 0.0
+            
+            # Trả về action đã cắt ngắn
+            return action_np[:self.n_cells]
+
+        # 1. Xử lý State
         raw_state = np.array(state).flatten()   
         augmented_state = self.augment_state(raw_state)
-        self.running_norm.update(augmented_state)
+        self.running_norm.update(augmented_state) # Giữ ở đây (VÀ XÓA TRONG HÀM UPDATE)
         normalized_augmented_state = self.running_norm.normalize(augmented_state)
         padded_augmented_state = self.pad_state(normalized_augmented_state)
-        # prepare tensor: shape (1, state_dim)
         state_tensor = torch.FloatTensor(padded_augmented_state).unsqueeze(0).to(self.device)
 
         with torch.no_grad():
+            # 2. Lấy Phân phối (Distribution)
             action_mean, action_logstd = self.actor(state_tensor)
+            # Dải clamp hẹp để tránh std quá nhỏ/lớn
+            action_logstd = torch.clamp(action_logstd, min=-3.0, max=-0.2)
+            action_std = torch.exp(action_logstd)
+            dist = torch.distributions.Normal(action_mean, action_std)
+
+            # 3. Lấy Action "Gợi ý"
             if self.training_mode:
-                action_std = torch.exp(action_logstd)
-                dist = torch.distributions.Normal(action_mean, action_std)
-                action = dist.sample()
+                action_tensor = dist.sample() # Sample nếu training
             else:
-                action = action_mean
+                action_tensor = action_mean # Dùng mean nếu inference
 
-        action = torch.clamp(action, 0.0, 1.0)
-        # Force padded cells (beyond n_cells) to zero
-        n = int(self.n_cells)
-        if self.max_cells > n:
-            action[..., n:] = 0.0
-
-        if self.training_mode:
-            with torch.no_grad():
-                # compute summed log_prob over active action dims (do NOT average)
-                n = int(self.n_cells)
-                log_prob_per_dim = dist.log_prob(action)  # shape (1, action_dim)
-                log_prob_sum = float(log_prob_per_dim[0, :n].sum().cpu().numpy())
-        else:
-            log_prob_sum = 0.0
-
-        self.current_padded_actions[env_id] = action.cpu().numpy().flatten()
-        truncated_action = action.squeeze()[:self.n_cells].cpu().numpy()
-
-        
-        # === Traffic-aware postprocessing ===
-        CELL_START_IDX = 17 + 14
-        cell_traffic = np.array([raw_state[CELL_START_IDX + 10*self.n_cells + k] for k in range(self.n_cells)])
-        mask_idle = (cell_traffic < 1e-3)
-        truncated_action[mask_idle] = 0.0
-        # Also mask the stored padded action for zero-traffic cells
-        padded_action_np = action.detach().cpu().numpy().flatten()
-        # Get indices of idle cells to mask them in the padded action array
-        idle_idx = np.where(mask_idle)[0]
-        if idle_idx.size > 0:
-            padded_action_np[idle_idx] = 0.0
-        # Ensure padded tail is zeroed
-        if self.max_cells > n:
-            padded_action_np[n:] = 0.0
-        self.current_padded_actions[env_id] = padded_action_np
-        # === End ===
-        
-        if np.all(mask_idle):
-            log_prob_sum = 0.0
-
-        # if env_id == 0:
-        #     print("Action:", action.cpu().numpy().flatten())
-        #     print("Truncated Action:", truncated_action)
-        
-        self.last_log_probs[env_id] = log_prob_sum
-        if not self.training_mode:
-            self.prev_states[env_id] = raw_state.copy()
+            # 4. Ép (Force) Action (TẤT CẢ TRONG PYTORCH)
+            action_final_tensor = action_tensor.clone()
+            n = int(self.n_cells)
             
-        return truncated_action
+            # --- Ép theo Traffic (Post-processing) ---
+            CELL_START_IDX = 17 + 14
+            n_cells_int = int(self.n_cells) # Đảm bảo là số nguyên
+            cell_traffic = np.array([raw_state[CELL_START_IDX + 10*n_cells_int + k] for k in range(n_cells_int)])
+            mask_idle = (cell_traffic < 1e-3)
+            mask_active_np = (~mask_idle).astype(np.float32)
+            idle_idx = np.where(mask_idle)[0]
+            if idle_idx.size > 0:
+                # Chuyển idle_idx (numpy) sang tensor để index
+                idle_idx_tensor = torch.tensor(idle_idx, device=self.device, dtype=torch.long)
+                action_final_tensor[0, idle_idx_tensor] = 0.0 # Ép cell idle về 0
+            # --- Hết ---
+
+            # Ép cell padding (ngoài n_cells) về 0
+            if self.max_cells > n:
+                action_final_tensor[0, n:] = 0.0
+
+            # Clamp action cuối cùng về [0, 1]
+            action_final_tensor = torch.clamp(action_final_tensor, 0.0, 1.0)
+            
+            # 5. TÍNH LOG_PROB TRÊN ACTION CUỐI CÙNG (A_forced)
+            if self.training_mode:
+                # Tính log_prob của action_final_tensor (là action sẽ được thực thi)
+                log_prob_per_dim = dist.log_prob(action_final_tensor)
+                # Áp dụng mask: chỉ tính trên cell active
+                mask_active_tensor = torch.from_numpy(mask_active_np).to(self.device)
+                log_prob_sum = float((log_prob_per_dim[0, :n] * mask_active_tensor).sum().cpu().numpy())
+            else:
+                log_prob_sum = 0.0
+            
+            # 6. Lưu Action và Log_Prob đã đồng bộ
+            action_final_np = action_final_tensor.cpu().numpy().flatten()
+            self.current_padded_actions[env_id] = action_final_np
+            self.last_log_probs[env_id] = log_prob_sum
+            
+            # Trả về action đã cắt ngắn cho môi trường
+            truncated_action = action_final_np[:n]
+            
+            if not self.training_mode:
+                self.prev_states[env_id] = raw_state.copy()
+            
+            # if np.random.random() < 0.2:
+            #     print(f"Action: {truncated_action}")
+                
+            return truncated_action
 
     
     ## OPTIONAL: Modify reward calculation as needed
@@ -520,7 +532,7 @@ class RLAgent:
             reward = -energy_scale * total_energy_delta / total_traffic_demand
 
         # Clip để tránh outlier
-        reward = np.clip(reward, -1000.0, 1000.0)
+        reward = np.clip(reward, -100.0, 100.0)
 
         if env_id == 0 and np.random.random() < 0.02:
             print(f"Energy Delta={total_energy_delta:.4f}, Total Traffic Demand={total_traffic_demand:.4f}, Reward={reward:.4f}")
@@ -555,21 +567,17 @@ class RLAgent:
 
         def _violation_penalty(x, th):
             violation_ratio = max(0.0, (x - th) / max(1e-6, th))
-            return violation_ratio ** 3
+            return violation_ratio
 
         drop_violation = _violation_penalty(drop, drop_th)
         latency_violation = _violation_penalty(latency, latency_th)
         cpu_violation = _violation_penalty(max_cpu, cpu_th)
         prb_violation = _violation_penalty(max_prb, prb_th)
 
-        qos_cost = (
-            config.get('drop_cost_coeff', 1.0) * drop_violation +
-            config.get('latency_cost_coeff', 1.0) * latency_violation +
-            config.get('cpu_cost_coeff', 1.0) * cpu_violation +
-            config.get('prb_cost_coeff', 1.0) * prb_violation
-        )
+        qos_cost = drop_violation + latency_violation + cpu_violation + prb_violation
 
-        qos_cost = np.clip(qos_cost, 0.0, 1000.0)
+        qos_cost = np.clip(qos_cost, 0.0, 100.0)
+        qos_cost = qos_cost * config['cost_scale']
 
         if env_id == 0 and np.random.random() < 0.02:
             print(f"Drop={drop:.4f}%, Latency={latency:.4f}ms, CPU={max_cpu:.4f}%, PRB={max_prb:.4f}%")
@@ -612,7 +620,6 @@ class RLAgent:
         # Ensure proper shapes
         raw_state = np.array(state).flatten().copy()
         augmented_state = self.augment_state(raw_state)
-        self.running_norm.update(augmented_state)
         normalized_augmented_state = self.running_norm.normalize(augmented_state)
         padded_augmented_state = self.pad_state(normalized_augmented_state)
         
@@ -627,13 +634,24 @@ class RLAgent:
         # Build transition with next_state retained (normalized/padded/augmented like state)
         raw_next_state = np.array(next_state).flatten().copy()
         next_augmented_state = self.augment_state(raw_next_state)
-        self.running_norm.update(next_augmented_state)
         normalized_next_augmented_state = self.running_norm.normalize(next_augmented_state)
         padded_next_augmented_state = self.pad_state(normalized_next_augmented_state)
+
+        # Build action mask from prev raw_state (active cells only)
+        CELL_START_IDX = 17 + 14
+        n_cells_int = int(self.n_cells)
+        cell_traffic_prev = np.array([raw_state[CELL_START_IDX + 10*n_cells_int + k] for k in range(n_cells_int)])
+        mask_active = (~(cell_traffic_prev < 1e-3)).astype(np.float32)
+        # Pad mask to max_cells for consistent shape
+        if self.max_cells > n_cells_int:
+            mask_padded = np.concatenate([mask_active, np.zeros(self.max_cells - n_cells_int, dtype=np.float32)])
+        else:
+            mask_padded = mask_active[:self.max_cells]
 
         transition = Transition(
             state=padded_augmented_state,
             action=action,
+            mask=mask_padded,
             reward=actual_reward,
             cost=actual_cost,
             next_state=padded_next_augmented_state,
@@ -663,11 +681,12 @@ class RLAgent:
             return
 
         # Fetch and clear buffer
-        states, actions, rewards, costs, next_states, dones, old_log_probs, values, env_ids = self.buffer.get_all_and_clear()
+        states, actions, masks, rewards, costs, next_states, dones, old_log_probs, values, env_ids = self.buffer.get_all_and_clear()
 
         # convert lists -> numpy arrays / tensors
         states = np.asarray(states, dtype=np.float32)
         actions = np.asarray(actions, dtype=np.float32)
+        masks = np.asarray(masks, dtype=np.float32)
         rewards = np.asarray(rewards, dtype=np.float32)
         next_states = np.asarray(next_states, dtype=np.float32)
         costs = np.asarray(costs, dtype=np.float32)
@@ -740,6 +759,7 @@ class RLAgent:
         # Dataset tensors
         states_tensor = torch.FloatTensor(states).to(self.device)
         actions_tensor = torch.FloatTensor(actions).to(self.device)
+        masks_tensor = torch.FloatTensor(masks).to(self.device)
         old_log_probs_tensor = torch.FloatTensor(old_log_probs).to(self.device)
         advantages_tensor = all_advantages
         returns_tensor = all_returns
@@ -756,8 +776,12 @@ class RLAgent:
         else:
             cost_advantages_tensor = cost_advantages_tensor - cost_advantages_tensor.mean()
 
+        advantages_tensor = torch.clamp(advantages_tensor, min=-10.0, max=10.0)
+        cost_advantages_tensor = torch.clamp(cost_advantages_tensor, min=-10.0, max=10.0)
+        
         dataset = torch.utils.data.TensorDataset(
-            states_tensor, actions_tensor, old_log_probs_tensor, advantages_tensor, returns_tensor,
+            states_tensor, actions_tensor, masks_tensor,
+            old_log_probs_tensor, advantages_tensor, returns_tensor,
             cost_advantages_tensor, cost_returns_tensor
         )
         loader = torch.utils.data.DataLoader(dataset, batch_size=self.batch_size, shuffle=True)
@@ -769,19 +793,27 @@ class RLAgent:
 
         for epoch in range(self.ppo_epochs):
             for batch in loader:
-                (batch_states, batch_actions, batch_old_log_probs,
+                (batch_states, batch_actions, batch_masks, batch_old_log_probs,
                  batch_advantages, batch_returns,
                  batch_cost_advantages, batch_cost_returns) = batch
                 action_mean, action_logstd = self.actor(batch_states)
+                action_logstd = torch.clamp(action_logstd, min=-3.0, max=-0.2)
                 action_std = torch.exp(action_logstd)
                 dist = torch.distributions.Normal(action_mean, action_std)
 
                 n = int(self.n_cells)
                 log_prob_per_dim = dist.log_prob(batch_actions)
-                new_log_probs = log_prob_per_dim[:, :n].sum(-1)
-                entropy = dist.entropy()[:, :n].sum(-1).mean()
+                mask_active = batch_masks[:, :n]
+                new_log_probs = (log_prob_per_dim[:, :n] * mask_active).sum(-1)
+                # Entropy on active dims only
+                entropy = (dist.entropy()[:, :n] * mask_active).sum(-1)
+                # Normalize by number of active dims per sample to keep scale stable
+                active_counts = mask_active.sum(-1).clamp(min=1.0)
+                entropy = (entropy / active_counts).mean()
 
-                ratio = torch.exp(new_log_probs - batch_old_log_probs)
+                # Clamp log-ratio to avoid exponential blow-up (tighter)
+                log_ratio = (new_log_probs - batch_old_log_probs).clamp(-2.0, 2.0)
+                ratio = torch.exp(log_ratio)
                 # Reward surrogate
                 surr1_r = ratio * batch_advantages
                 surr2_r = torch.clamp(ratio, 1 - self.clip_epsilon, 1 + self.clip_epsilon) * batch_advantages
@@ -792,12 +824,13 @@ class RLAgent:
                 L_cost = torch.min(surr1_c, surr2_c).mean()
                 # Lagrangian objective (maximize reward, minimize cost)
                 lagrange = torch.clamp(torch.tensor(self.lambda_multiplier, device=self.device), 0.0, self.lambda_max)
-                actor_loss = -(L_reward - lagrange * L_cost) - self.entropy_coef * entropy
-                current_values = self.critic(batch_states).squeeze()
-                critic_loss = nn.MSELoss()(current_values, batch_returns.detach())
+                # Entropy bonus for exploration
+                actor_loss = -(L_reward - lagrange * L_cost + self.entropy_coef * entropy)
+                current_values = self.critic(batch_states).view(-1)
+                critic_loss = nn.MSELoss()(current_values, batch_returns.view(-1).detach())
                 # Cost critic loss
-                current_cost_values = self.cost_critic(batch_states).squeeze()
-                cost_critic_loss = nn.MSELoss()(current_cost_values, batch_cost_returns.detach())
+                current_cost_values = self.cost_critic(batch_states).view(-1)
+                cost_critic_loss = nn.MSELoss()(current_cost_values, batch_cost_returns.view(-1).detach())
 
                 self.actor_optimizer.zero_grad()
                 actor_loss.backward()
