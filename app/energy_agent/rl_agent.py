@@ -422,18 +422,6 @@ class RLAgent:
         Correctly computes log_prob *after* forcing/clamping actions.
         """
 
-        if self.current_episode <= 1 and self.training_mode: # Chỉ warmup khi training
-            print("Warmup episode, returning fixed action")
-            action_val = 0.7
-            action_np = np.ones(self.max_cells) * action_val
-            
-            # Cập nhật action đã thực thi (Phần này bạn đã sửa đúng)
-            self.current_padded_actions[env_id] = action_np
-            self.last_log_probs[env_id] = 0.0
-            
-            # Trả về action đã cắt ngắn
-            return action_np[:self.n_cells]
-
         # 1. Xử lý State
         raw_state = np.array(state).flatten()   
         augmented_state = self.augment_state(raw_state)
