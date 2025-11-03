@@ -460,18 +460,7 @@ class RLAgent:
             action_final_tensor = action_tensor.clone()
             n = int(self.n_cells)
             
-            # --- Ép theo Traffic (Post-processing) ---
-            CELL_START_IDX = 17 + 14
-            n_cells_int = int(self.n_cells) # Đảm bảo là số nguyên
-            cell_traffic = np.array([raw_state[CELL_START_IDX + 10*n_cells_int + k] for k in range(n_cells_int)])
-            mask_idle = (cell_traffic < 1e-3)
-            mask_active_np = (~mask_idle).astype(np.float32)
-            idle_idx = np.where(mask_idle)[0]
-            if idle_idx.size > 0:
-                # Chuyển idle_idx (numpy) sang tensor để index
-                idle_idx_tensor = torch.tensor(idle_idx, device=self.device, dtype=torch.long)
-                action_final_tensor[0, idle_idx_tensor] = 0.0 # Ép cell idle về 0
-            # --- Hết ---
+            # (Bỏ post-processing theo traffic: không ép cell idle về 0)
 
             # Ép cell padding (ngoài n_cells) về 0
             if self.max_cells > n:
@@ -484,9 +473,8 @@ class RLAgent:
             if self.training_mode:
                 # Tính log_prob của action_final_tensor (là action sẽ được thực thi)
                 log_prob_per_dim = dist.log_prob(action_final_tensor)
-                # Áp dụng mask: chỉ tính trên cell active
-                mask_active_tensor = torch.from_numpy(mask_active_np).to(self.device)
-                log_prob_sum = float((log_prob_per_dim[0, :n] * mask_active_tensor).sum().cpu().numpy())
+                # Tổng log_prob theo n cell
+                log_prob_sum = float(log_prob_per_dim[0, :n].sum().cpu().numpy())
             else:
                 log_prob_sum = 0.0
             
@@ -637,21 +625,9 @@ class RLAgent:
         normalized_next_augmented_state = self.running_norm.normalize(next_augmented_state)
         padded_next_augmented_state = self.pad_state(normalized_next_augmented_state)
 
-        # Build action mask from prev raw_state (active cells only)
-        CELL_START_IDX = 17 + 14
-        n_cells_int = int(self.n_cells)
-        cell_traffic_prev = np.array([raw_state[CELL_START_IDX + 10*n_cells_int + k] for k in range(n_cells_int)])
-        mask_active = (~(cell_traffic_prev < 1e-3)).astype(np.float32)
-        # Pad mask to max_cells for consistent shape
-        if self.max_cells > n_cells_int:
-            mask_padded = np.concatenate([mask_active, np.zeros(self.max_cells - n_cells_int, dtype=np.float32)])
-        else:
-            mask_padded = mask_active[:self.max_cells]
-
         transition = Transition(
             state=padded_augmented_state,
             action=action,
-            mask=mask_padded,
             reward=actual_reward,
             cost=actual_cost,
             next_state=padded_next_augmented_state,
@@ -681,12 +657,11 @@ class RLAgent:
             return
 
         # Fetch and clear buffer
-        states, actions, masks, rewards, costs, next_states, dones, old_log_probs, values, env_ids = self.buffer.get_all_and_clear()
+        states, actions, rewards, costs, next_states, dones, old_log_probs, values, env_ids = self.buffer.get_all_and_clear()
 
         # convert lists -> numpy arrays / tensors
         states = np.asarray(states, dtype=np.float32)
         actions = np.asarray(actions, dtype=np.float32)
-        masks = np.asarray(masks, dtype=np.float32)
         rewards = np.asarray(rewards, dtype=np.float32)
         next_states = np.asarray(next_states, dtype=np.float32)
         costs = np.asarray(costs, dtype=np.float32)
@@ -759,7 +734,6 @@ class RLAgent:
         # Dataset tensors
         states_tensor = torch.FloatTensor(states).to(self.device)
         actions_tensor = torch.FloatTensor(actions).to(self.device)
-        masks_tensor = torch.FloatTensor(masks).to(self.device)
         old_log_probs_tensor = torch.FloatTensor(old_log_probs).to(self.device)
         advantages_tensor = all_advantages
         returns_tensor = all_returns
@@ -780,7 +754,7 @@ class RLAgent:
         cost_advantages_tensor = torch.clamp(cost_advantages_tensor, min=-10.0, max=10.0)
         
         dataset = torch.utils.data.TensorDataset(
-            states_tensor, actions_tensor, masks_tensor,
+            states_tensor, actions_tensor,
             old_log_probs_tensor, advantages_tensor, returns_tensor,
             cost_advantages_tensor, cost_returns_tensor
         )
@@ -793,7 +767,7 @@ class RLAgent:
 
         for epoch in range(self.ppo_epochs):
             for batch in loader:
-                (batch_states, batch_actions, batch_masks, batch_old_log_probs,
+                (batch_states, batch_actions, batch_old_log_probs,
                  batch_advantages, batch_returns,
                  batch_cost_advantages, batch_cost_returns) = batch
                 action_mean, action_logstd = self.actor(batch_states)
@@ -803,13 +777,8 @@ class RLAgent:
 
                 n = int(self.n_cells)
                 log_prob_per_dim = dist.log_prob(batch_actions)
-                mask_active = batch_masks[:, :n]
-                new_log_probs = (log_prob_per_dim[:, :n] * mask_active).sum(-1)
-                # Entropy on active dims only
-                entropy = (dist.entropy()[:, :n] * mask_active).sum(-1)
-                # Normalize by number of active dims per sample to keep scale stable
-                active_counts = mask_active.sum(-1).clamp(min=1.0)
-                entropy = (entropy / active_counts).mean()
+                new_log_probs = log_prob_per_dim[:, :n].sum(-1)
+                entropy = dist.entropy()[:, :n].sum(-1).mean()
 
                 # Clamp log-ratio to avoid exponential blow-up (tighter)
                 log_ratio = (new_log_probs - batch_old_log_probs).clamp(-2.0, 2.0)

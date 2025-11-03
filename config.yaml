@@ -7,10 +7,10 @@ checkpoint_save_path: "models/um_run1.pth"
 actor_lr: 0.0001
 critic_lr: 0.0003
 
-energy_reward_scale: 100.0
-cost_scale: 0.1
+energy_reward_scale: 10.0
+cost_scale: 1.0
 
-entropy_coef: 0.005
+entropy_coef: 0.01
 gamma: 0.99
 lambda_gae: 0.95
 clip_epsilon: 0.2
@@ -22,7 +22,7 @@ hidden_dim: 256
 
 # Lagrangian PPO settings
 lambda_init: 0.0
-lambda_lr: 0.01
+lambda_lr: 0.05
 lambda_max: 100.0
 # Target average cost per step (set per-scenario scale). 0 encourages constraint satisfaction.
 cost_target: 0.0
