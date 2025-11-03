@@ -7,7 +7,7 @@ checkpoint_save_path: "models/um.pth"
 actor_lr: 0.0003
 critic_lr: 0.001
 
-energy_grad_coeff: 1000.0
+energy_reward_scale: 10.0
 drop_cost_coeff: 10.0
 latency_cost_coeff: 10.0
 cpu_cost_coeff: 10.0
@@ -19,7 +19,7 @@ lambda_gae: 0.95
 clip_epsilon: 0.2
 ppo_epochs: 8
 batch_size: 4
-buffer_size: 2048
+buffer_size: 40
 n_envs: 4
 hidden_dim: 256
 

@@ -2,7 +2,6 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from collections import deque
 import logging
 import os
 from datetime import datetime
@@ -14,7 +13,6 @@ import matplotlib.pyplot as plt
 from .transition import Transition, TrajectoryBuffer
 from .models import Actor
 from .models import Critic
-from .state_normalizer import StateNormalizer
 
 torch.manual_seed(42)
 np.random.seed(42)
@@ -23,6 +21,58 @@ torch.backends.cudnn.deterministic = True
 torch.backends.cudnn.benchmark = False
 
 config = yaml.safe_load(open('config.yaml'))
+
+class RunningNorm:
+    """
+    Adaptive normalizer for augmented state vectors.
+    Tracks running mean and variance for each feature (column-wise).
+    Works for both global + per-cell stacked features.
+    """
+    def __init__(self, state_dim, eps=1e-8):
+        self.mean = np.zeros(state_dim, dtype=np.float32)
+        self.var = np.ones(state_dim, dtype=np.float32)
+        self.count = eps
+        self.eps = eps
+
+    def update(self, x):
+        """
+        Update running mean/var statistics.
+        Args:
+            x (np.ndarray): batch of states, shape (batch_size, state_dim)
+        """
+        batch_mean = np.mean(x, axis=0)
+        batch_var = np.var(x, axis=0)
+        batch_count = x.shape[0]
+
+        delta = batch_mean - self.mean
+        tot_count = self.count + batch_count
+
+        new_mean = self.mean + delta * batch_count / tot_count
+
+        m_a = self.var * self.count
+        m_b = batch_var * batch_count
+        M2 = m_a + m_b + np.square(delta) * self.count * batch_count / tot_count
+        new_var = M2 / tot_count
+
+        self.mean, self.var, self.count = new_mean, new_var, tot_count
+
+    def normalize(self, x):
+        """
+        Normalize input state(s) using running mean/var.
+        Args:
+            x (np.ndarray): state or batch, shape (..., state_dim)
+        Returns:
+            np.ndarray: normalized state(s)
+        """
+        return (x - self.mean) / (np.sqrt(self.var) + self.eps)
+
+    def denormalize(self, x):
+        """
+        Reverse normalization (optional, for debugging).
+        """
+        return x * np.sqrt(self.var) + self.mean
+
+
 
 class RLAgent:
     def __init__(self, n_cells, n_ues, max_time, log_file='rl_agent.log', use_gpu=False, max_cells=100):
@@ -41,11 +91,9 @@ class RLAgent:
         self.max_time = int(max_time)
         self.use_gpu = config['use_gpu'] and torch.cuda.is_available()
         self.device = torch.device('cuda' if self.use_gpu else 'cpu')
-        
-        self.original_state_dim = 17 + 14 + (self.max_cells * 12)
-        
-        # 9 global features + 4 delta features + 2*max_cells local features
-        self.state_dim = self.original_state_dim + 9 + 4 + 2*self.max_cells
+                
+        # 7 global features + 10 augmented features + 8*max_cells local features
+        self.state_dim = 7 + 10 + 8*max_cells
         
         # Power ratio for each cell
         self.action_dim = self.max_cells
@@ -67,10 +115,7 @@ class RLAgent:
         self.lambda_multiplier = float(config.get('lambda_init', 1.0))
         self.lambda_max = float(config.get('lambda_max', 10.0))
         self.cost_target = float(config.get('cost_target', 0.0))
-        
-        # Normalization parameters, use original state dimension and n_cells for state normalizer
-        self.state_normalizer = StateNormalizer(self.original_state_dim, n_cells=self.n_cells)
-        
+                
         # use augmented state dimension for actor and critic
         self.actor = Actor(self.state_dim, self.action_dim, self.hidden_dim).to(self.device)
         self.critic = Critic(self.state_dim, self.hidden_dim).to(self.device)
@@ -83,8 +128,13 @@ class RLAgent:
         self.training_mode = config['training_mode']
         self.checkpoint_load_path = config['checkpoint_load_path']
         self.checkpoint_save_path = config['checkpoint_save_path']
+        
         # Experience buffer (per-env, flat with env_id)
         self.buffer = TrajectoryBuffer()
+        
+        # Running normalization
+        # use state_dim before padding for running normalization
+        self.running_norm = RunningNorm(state_dim=7 + 10 + 8*n_cells)
         
         # Scale episode step target by number of envs to keep similar update cadence
         self.step_per_episode = max(1, int(config['buffer_size'] // max(1, self.n_envs)))
@@ -122,263 +172,204 @@ class RLAgent:
         if os.path.exists(self.checkpoint_load_path):
             self.load_model(self.checkpoint_load_path)
             self.logger.info(f"Loaded checkpoint from {self.checkpoint_load_path}")
-            # self.logger.info(f"Fine-tuning with learning rate 3e-5 for actor and 1e-4 for critic")
-            # self.actor_optimizer.param_groups[0]['lr'] = 3e-5
-            # self.critic_optimizer.param_groups[0]['lr'] = 1e-4
         else:
             self.logger.info(f"No checkpoint found at {self.checkpoint_load_path}")
-
-    def normalize_augmented_features(self, global_features, 
-                                     load_deltas, ue_deltas, 
-                                     delta_features):
-        """Normalizes only the newly created features using predefined bounds.
-        
-        Uses consistent bounds with StateNormalizer where applicable.
-        """
-
-        bounds = {
-            # Reuse from StateNormalizer.simulation_bounds
-            'ue_density': [0, 20],          
-            'isd': [100, 2000],                 # Same as StateNormalizer
-            'base_power': [100, 1000],          # Same as StateNormalizer
-            
-            # Distance to thresholds (new features)
-            'dist_to_drop_thresh': [-20, 10],  # Can go negative (over threshold)
-            'dist_to_latency_thresh': [-200, 100],  # Based on latencyThreshold bounds
-            'dist_to_cpu_thresh': [-30, 95],   # Based on cpuThreshold bounds  
-            'dist_to_prb_thresh': [-30, 95],   # Based on prbThreshold bounds
-            
-            # Efficiency metrics (new features)
-            'load_per_active_cell': [0, 5000/1],  # totalTraffic / 1 active cell
-            'power_efficiency': [0, 5000/100],     # totalTraffic / min power
-            
-            # Cell deltas (spatial)
-            'load_deltas': [-1000, 1000],      # Cell load deviation
-            'ue_deltas': [-50, 50],            # Cell UE deviation
-            
-            # Temporal deltas (time-series trends) - NEW
-            'drop_rate_delta': [-20, 20],     # Based on avgDropRate bounds
-            'latency_delta': [-200, 200],     # Based on avgLatency bounds  
-            'energy_delta': [-5000, 5000],    # Based on totalEnergy bounds
-            'active_cells_delta': [-50, 50],  # Based on activeCells bounds
-        }
-
-        def normalize(val, min_v, max_v):
-            val = np.clip(val, min_v, max_v)
-            return (val - min_v) / (max_v - min_v + 1e-8)
-
-        norm_global = np.array([
-            normalize(global_features[0], *bounds['ue_density']),
-            normalize(global_features[1], *bounds['isd']),
-            normalize(global_features[2], *bounds['base_power']),
-            normalize(global_features[3], *bounds['dist_to_drop_thresh']),
-            normalize(global_features[4], *bounds['dist_to_latency_thresh']),
-            normalize(global_features[5], *bounds['dist_to_cpu_thresh']),
-            normalize(global_features[6], *bounds['dist_to_prb_thresh']),
-            normalize(global_features[7], *bounds['load_per_active_cell']),
-            normalize(global_features[8], *bounds['power_efficiency']),
-        ])
-        
-        norm_load_deltas = normalize(load_deltas, *bounds['load_deltas'])
-        norm_ue_deltas = normalize(ue_deltas, *bounds['ue_deltas'])
-        
-        norm_delta_features = np.array([
-            normalize(delta_features[0], *bounds['drop_rate_delta']),
-            normalize(delta_features[1], *bounds['latency_delta']),
-            normalize(delta_features[2], *bounds['energy_delta']), 
-            normalize(delta_features[3], *bounds['active_cells_delta']),
-        ])
-
-        return norm_global, norm_load_deltas, norm_ue_deltas, norm_delta_features
     
-    def augment_state(self, current_state_raw, normalized_padded_state, prev_state_raw=None):
+    def augment_state(self, current_state_raw, prev_state_raw=None):
         """
-        Create new features from raw state to provide context and objectives for the agent.
-        
-        Args:
-            current_state_raw (np.ndarray): Raw state vector, not normalized, not padded.
-            normalized_padded_state (np.ndarray): Normalized and padded state vector.
-            prev_state_raw (np.ndarray): Previous raw state for delta computation
+        Selective augmentation (raw, no normalization, no padding).
+        Returns 1D numpy array of floats.
+        """
+        cur = np.asarray(current_state_raw).flatten()
+        n = int(self.n_cells)
 
-        Returns:
-            np.ndarray: Augmented state vector
-        """
-        # --- 1. Analyze raw state ---
         NETWORK_START_IDX = 17
-        CELL_FEATURES_START_IDX = 31 # 17 (sim) + 14 (net)
+        CELL_START_IDX = 31  # column-stacked base
 
-        # Global features from simulation_features
-        total_ues_config = current_state_raw[1]
-        isd = current_state_raw[6]
-        base_power = current_state_raw[9]
-        drop_threshold = current_state_raw[11]
-        latency_threshold = current_state_raw[12]
-        cpu_threshold = current_state_raw[13]
-        prb_threshold = current_state_raw[14]
+        # --- safe global reads ---
+        drop_threshold = float(cur[11])
+        latency_threshold = float(cur[12])
+        cpu_threshold = float(cur[13])
+        prb_threshold = float(cur[14])
 
-        # Global features from network_features
-        active_cells = current_state_raw[NETWORK_START_IDX + 1]
-        current_drop_rate = current_state_raw[NETWORK_START_IDX + 2]
-        current_latency = current_state_raw[NETWORK_START_IDX + 3]
-        total_traffic = current_state_raw[NETWORK_START_IDX + 4]
-        total_tx_power = current_state_raw[NETWORK_START_IDX + 12]
+        active_cells = float(cur[NETWORK_START_IDX + 1])
+        current_drop_rate = float(cur[NETWORK_START_IDX + 2])
+        current_latency = float(cur[NETWORK_START_IDX + 3])
+        total_traffic = float(cur[NETWORK_START_IDX + 4])
+        total_tx_power = float(cur[NETWORK_START_IDX + 12])
+        current_energy = float(cur[NETWORK_START_IDX + 0])
 
-        # Analyze data from each cell
-        max_cpu_usage = 0
-        max_prb_usage = 0
-        avg_cell_load = 0
-        avg_cell_ues = 0
+        # prev-safe
+        if prev_state_raw is not None:
+            prev = np.asarray(prev_state_raw).flatten()
+            prev_energy = float(prev[NETWORK_START_IDX + 0])
+            prev_drop_rate = float(prev[NETWORK_START_IDX + 2])
+            prev_latency = float(prev[NETWORK_START_IDX + 3])
+        else:
+            prev_energy = current_energy
+            prev_drop_rate = current_drop_rate
+            prev_latency = current_latency
 
-        CPU_FEATURE_IDX = CELL_FEATURES_START_IDX
-        PRB_FEATURE_IDX = CELL_FEATURES_START_IDX + self.n_cells
-        LOAD_FEATURE_IDX = CELL_FEATURES_START_IDX + 2 * self.n_cells
-        UE_FEATURE_IDX = CELL_FEATURES_START_IDX + 4 * self.n_cells
-        max_cpu_usage = np.max(current_state_raw[CPU_FEATURE_IDX:CPU_FEATURE_IDX + self.n_cells])
-        max_prb_usage = np.max(current_state_raw[PRB_FEATURE_IDX:PRB_FEATURE_IDX + self.n_cells])
-        all_cell_loads = current_state_raw[LOAD_FEATURE_IDX:LOAD_FEATURE_IDX + self.n_cells]
-        all_cell_ues = current_state_raw[UE_FEATURE_IDX:UE_FEATURE_IDX + self.n_cells]
-        avg_cell_load = np.mean(all_cell_loads)
-        avg_cell_ues = np.mean(all_cell_ues)
+        # --- per-cell extraction (column-stacked) ---
+        def read_block(offset):
+            if n == 0:
+                return np.zeros(0, dtype=np.float32)
+            start = CELL_START_IDX + offset * n
+            return np.asarray(cur[start:start + n], dtype=np.float32)
 
-        # --- 2. Create new features ---
-        # UE density, a golden metric to distinguish Rural and Urban/Indoor
-        ue_density = total_ues_config / (self.max_cells + 1e-6)
+        per_cell_total_traffic_demand = read_block(10)   # block offset 10
+        per_cell_tx_power             = read_block(5)    # block offset 5
+        per_cell_energy_consumption   = read_block(6)    # block offset 6
+        per_cell_load_ratio           = read_block(11)   # block offset 11
+        per_cell_prb_usage            = read_block(1)    # block offset 1
+        per_cell_cpu_usage            = read_block(0)    # block offset 0
+        per_cell_avg_sinr             = read_block(9)    # block offset 9
 
-        # Distance to dangerous zones
+        # safe aggregates
+        if n > 0:
+            max_cpu_usage = float(np.max(per_cell_cpu_usage))
+            max_prb_usage = float(np.max(per_cell_prb_usage))
+            avg_cell_load = float(np.mean(per_cell_load_ratio))
+            all_cell_loads = per_cell_load_ratio.copy().astype(np.float32)
+        else:
+            max_cpu_usage = 0.0
+            max_prb_usage = 0.0
+            avg_cell_load = 0.0
+            all_cell_loads = np.zeros(0, dtype=np.float32)
+
+        # --- global features (raw) ---
+        global_features = np.array([
+            total_traffic,
+            active_cells,
+            total_tx_power,
+            current_drop_rate,
+            current_latency,
+            max_cpu_usage,
+            max_prb_usage,
+        ], dtype=np.float32)
+
+        # --- augmented scalars (raw) ---
         dist_to_drop_thresh = drop_threshold - current_drop_rate
         dist_to_latency_thresh = latency_threshold - current_latency
         dist_to_cpu_thresh = cpu_threshold - max_cpu_usage
         dist_to_prb_thresh = prb_threshold - max_prb_usage
-                
-        # Network efficiency
-        load_per_active_cell = total_traffic / (active_cells + 1e-6)
-        # Load-Power efficiency: how much traffic is served per Watt of transmit power
-        power_efficiency = total_traffic / (total_tx_power + 1e-6)
-        
-        # Local correlation features (Hotspot/Coldspot)
-        load_deltas = all_cell_loads - avg_cell_load
-        ue_deltas = all_cell_ues - avg_cell_ues
-        
-        # Temporal delta features (trends) - substitute for GRU memory
-        current_energy = current_state_raw[NETWORK_START_IDX + 0]
-        if prev_state_raw is not None:
-            prev_drop_rate = prev_state_raw[NETWORK_START_IDX + 2]
-            prev_latency = prev_state_raw[NETWORK_START_IDX + 3]
-            prev_energy = prev_state_raw[NETWORK_START_IDX + 0]
-            prev_active_cells = prev_state_raw[NETWORK_START_IDX + 1]
-            
-            drop_rate_delta = current_drop_rate - prev_drop_rate
-            latency_delta = current_latency - prev_latency
-            energy_delta = current_energy - prev_energy
-            active_cells_delta = active_cells - prev_active_cells
+
+        drop_rate_delta = current_drop_rate - prev_drop_rate
+        latency_delta = current_latency - prev_latency
+        energy_delta = current_energy - prev_energy
+
+        safe_active_cells = max(1.0, active_cells)
+        load_per_active_cell = total_traffic / safe_active_cells
+
+        # power_efficiency: use log1p to avoid explosion; keep raw scale
+        power_efficiency = np.log1p(total_traffic) / (np.log1p(total_tx_power) + 1e-6)
+        # clamp to reasonable raw bounds so downstream code doesn't explode
+        power_efficiency = float(np.clip(power_efficiency, -1e6, 1e6))
+
+        lambda_multiplier = float(getattr(self, "lambda_multiplier", 0.0))
+
+        augmented_features = np.array([
+            dist_to_drop_thresh,
+            dist_to_latency_thresh,
+            dist_to_cpu_thresh,
+            dist_to_prb_thresh,
+            drop_rate_delta,
+            latency_delta,
+            energy_delta,
+            load_per_active_cell,
+            power_efficiency,
+            lambda_multiplier,
+        ], dtype=np.float32)
+
+        # local correlation (hotspot) = per cell load deviation from mean
+        load_deltas = (all_cell_loads - avg_cell_load).astype(np.float32) if n > 0 else np.zeros(0, dtype=np.float32)
+
+        # --- assemble per-cell flat block (concatenate blocks in chosen order) ---
+        # order: traffic, txPower, energy, loadRatio, prbUsage, cpuUsage, avgSINR, load_delta
+        per_cell_blocks = [
+            per_cell_total_traffic_demand.astype(np.float32),
+            per_cell_tx_power.astype(np.float32),
+            per_cell_energy_consumption.astype(np.float32),
+            per_cell_load_ratio.astype(np.float32),
+            per_cell_prb_usage.astype(np.float32),
+            per_cell_cpu_usage.astype(np.float32),
+            per_cell_avg_sinr.astype(np.float32),
+            load_deltas.astype(np.float32),
+        ]
+
+        # concat safely even if n == 0
+        if len(per_cell_blocks) > 0:
+            per_cell_concat = np.concatenate(per_cell_blocks, axis=0) if per_cell_blocks[0].size > 0 else np.zeros(0, dtype=np.float32)
         else:
-            # First step, no deltas
-            drop_rate_delta = 0.0
-            latency_delta = 0.0
-            energy_delta = 0.0
-            active_cells_delta = 0.0
+            per_cell_concat = np.zeros(0, dtype=np.float32)
 
-        delta_features = np.array([drop_rate_delta, latency_delta, energy_delta, active_cells_delta])
-
-        global_features = np.array([
-            ue_density, isd, base_power, 
-            dist_to_drop_thresh, dist_to_latency_thresh, dist_to_cpu_thresh, dist_to_prb_thresh,
-            load_per_active_cell, power_efficiency
-            ]) 
-        delta_features = np.array([drop_rate_delta, latency_delta, energy_delta, active_cells_delta])
-        load_deltas = np.array(load_deltas)
-        ue_deltas = np.array(ue_deltas)
-        
-        
-        # normalize new features
-        (norm_global, 
-         norm_load_deltas, 
-         norm_ue_deltas,
-         norm_delta_features) = self.normalize_augmented_features(global_features, 
-                                                                  load_deltas, 
-                                                                  ue_deltas, 
-                                                                  delta_features)
-        
-        # padding load_deltas and ue_deltas to max_cells length
-        padded_deltas = np.zeros(self.max_cells - self.n_cells)
-        norm_load_deltas = np.concatenate([norm_load_deltas, padded_deltas])
-        norm_ue_deltas = np.concatenate([norm_ue_deltas, padded_deltas])
-        # --- 3. Assemble final State Vector ---
-        
-        # Create new feature array
+        # --- final augmented state vector (raw, not normalized, not padded) ---
         augmented_state = np.concatenate([
-            normalized_padded_state,
-            norm_global,
-            norm_delta_features,  # Temporal info
-            norm_load_deltas,
-            norm_ue_deltas
-        ])
-        
-        # Concatenate all: original state + new global features + new local features
+            global_features,
+            augmented_features,
+            per_cell_concat
+        ], axis=0).astype(np.float32)
+
         return augmented_state
-    
-    def pad_state(self, state):
-        """
-        Pad state for feature-block layout:
-        state layout:
-        [ simulation(17), network(14), f0_all_cells(n), f1_all_cells(n), ..., f11_all_cells(n) ]
-        After padding, each feature block has length max_cells.
 
-        Args:
-            state: 1D array-like (length = 17+14 + n_cells*12)
-            n_cells: actual number of cells (<= self.max_cells)
+    def pad_state(self, augmented_state):
+        """
+        Pad augmented_state (raw, not normalized) to fixed-length blocks per max_cells.
+        Expected input layout (column-stacked per-cell blocks):
+        [ global_features (7),
+            augmented_features (10),
+            block0 (n_cells), block1 (n_cells), ..., block7 (n_cells) ]
+        Where block order is:
+        0: per_cell_total_traffic_demand
+        1: per_cell_tx_power
+        2: per_cell_energy_consumption
+        3: per_cell_load_ratio
+        4: per_cell_prb_usage
+        5: per_cell_cpu_usage
+        6: per_cell_avg_sinr
+        7: load_deltas
+
         Returns:
-            padded_state: 1D np.array length = 17 + 14 + self.max_cells * 12
+        padded_state: 1D np.float32 array of length 17 + 8*max_cells
         """
-        state = np.asarray(state).flatten().astype(np.float32)
-
-        SIM_CNT = 17
-        NET_CNT = 14
-        CELL_FEATURE_COUNT = 12
-        max_cells = int(self.max_cells)
+        arr = np.asarray(augmented_state).flatten().astype(np.float32)
+        GLOBAL_CNT = 7
+        AUG_CNT = 10
+        PER_CELL_BLOCKS = 8
         n = int(self.n_cells)
+        max_cells = int(self.max_cells)
 
-        # basic checks
-        if n < 0 or n > max_cells:
-            raise ValueError(f"n_cells must be 0 <= n_cells <= max_cells ({max_cells}), got {n}")
+        expected_len = GLOBAL_CNT + AUG_CNT + PER_CELL_BLOCKS * n
+        if arr.size != expected_len:
+            raise ValueError(f"augmented_state length mismatch: got {arr.size}, expected {expected_len} "
+                            f"(check self.n_cells={n} and augmented_state layout)")
 
-        expected_cur_len = SIM_CNT + NET_CNT + n * CELL_FEATURE_COUNT
-        if state.size != expected_cur_len:
-            raise ValueError(f"state length mismatch: got {state.size}, expected {expected_cur_len} "
-                            "(check CELL_START_IDX, n_cells and layout)")
-
-        # head (simulation + network) stay the same
-        head = state[: SIM_CNT + NET_CNT ]
-
-        # start index for cell feature blocks
-        base = SIM_CNT + NET_CNT
+        head = arr[: GLOBAL_CNT + AUG_CNT]
+        base = GLOBAL_CNT + AUG_CNT
 
         pad_each = max_cells - n
-        if pad_each == 0:
-            return state  # already at max
-
         padded_blocks = []
-        for feat_idx in range(CELL_FEATURE_COUNT):
+        for feat_idx in range(PER_CELL_BLOCKS):
             start = base + feat_idx * n
             end = start + n
-            block = state[start:end]
             if n == 0:
-                # block is empty -> just zeros
                 padded_block = np.zeros(max_cells, dtype=np.float32)
             else:
-                padded_block = np.concatenate([block, np.zeros(pad_each, dtype=np.float32)])
+                block = arr[start:end]
+                if pad_each > 0:
+                    padded_block = np.concatenate([block, np.zeros(pad_each, dtype=np.float32)])
+                else:
+                    # already full size or n == max_cells
+                    padded_block = block[:max_cells]
             padded_blocks.append(padded_block)
 
-        # concatenate blocks in feature order: f0_all_cells_padded, f1_all_cells_padded, ...
-        cells_padded = np.concatenate(padded_blocks, axis=0)
+        # concatenate blocks in feature order: block0_padded, block1_padded, ...
+        cells_padded = np.concatenate(padded_blocks, axis=0) if padded_blocks else np.zeros(0, dtype=np.float32)
 
-        padded_state = np.concatenate([head, cells_padded], axis=0)
+        padded_state = np.concatenate([head, cells_padded], axis=0).astype(np.float32)
         return padded_state
 
-    
-    def normalize_state(self, state):
-        """Normalize state vector to [0, 1] range"""
-        return self.state_normalizer.normalize(state)
+
     
     def setup_logging(self, log_file):
         """Setup logging configuration"""
@@ -438,13 +429,12 @@ class RLAgent:
         """
 
         raw_state = np.array(state).flatten()   
-        normalized_state = self.normalize_state(raw_state)
-        normalized_padded_state = self.pad_state(normalized_state)
-        # Use prev_state to compute deltas (DON'T update yet, wait for update())
-        state = self.augment_state(raw_state, normalized_padded_state, self.prev_states.get(env_id))
-                
+        augmented_state = self.augment_state(raw_state)
+        self.running_norm.update(augmented_state)
+        normalized_augmented_state = self.running_norm.normalize(augmented_state)
+        padded_augmented_state = self.pad_state(normalized_augmented_state)
         # prepare tensor: shape (1, state_dim)
-        state_tensor = torch.FloatTensor(state).unsqueeze(0).to(self.device)
+        state_tensor = torch.FloatTensor(padded_augmented_state).unsqueeze(0).to(self.device)
 
         with torch.no_grad():
             action_mean, action_logstd = self.actor(state_tensor)
@@ -456,6 +446,10 @@ class RLAgent:
                 action = action_mean
 
         action = torch.clamp(action, 0.0, 1.0)
+        # Force padded cells (beyond n_cells) to zero
+        n = int(self.n_cells)
+        if self.max_cells > n:
+            action[..., n:] = 0.0
 
         if self.training_mode:
             with torch.no_grad():
@@ -467,11 +461,38 @@ class RLAgent:
             log_prob_sum = 0.0
 
         self.current_padded_actions[env_id] = action.cpu().numpy().flatten()
-        truncated_action = action.squeeze()[:self.n_cells]
+        truncated_action = action.squeeze()[:self.n_cells].cpu().numpy()
+
+        
+        # === Traffic-aware postprocessing ===
+        CELL_START_IDX = 17 + 14
+        cell_traffic = np.array([raw_state[CELL_START_IDX + 10*self.n_cells + k] for k in range(self.n_cells)])
+        mask_idle = (cell_traffic < 1e-3)
+        truncated_action[mask_idle] = 0.0
+        # Also mask the stored padded action for zero-traffic cells
+        padded_action_np = action.detach().cpu().numpy().flatten()
+        # Get indices of idle cells to mask them in the padded action array
+        idle_idx = np.where(mask_idle)[0]
+        if idle_idx.size > 0:
+            padded_action_np[idle_idx] = 0.0
+        # Ensure padded tail is zeroed
+        if self.max_cells > n:
+            padded_action_np[n:] = 0.0
+        self.current_padded_actions[env_id] = padded_action_np
+        # === End ===
+        
+        if np.all(mask_idle):
+            log_prob_sum = 0.0
+
+        # if env_id == 0:
+        #     print("Action:", action.cpu().numpy().flatten())
+        #     print("Truncated Action:", truncated_action)
+        
         self.last_log_probs[env_id] = log_prob_sum
         if not self.training_mode:
             self.prev_states[env_id] = raw_state.copy()
-        return truncated_action.cpu().numpy().flatten()
+            
+        return truncated_action
 
     
     ## OPTIONAL: Modify reward calculation as needed
@@ -481,31 +502,30 @@ class RLAgent:
         - Objective: minimize total energy (or per-traffic energy)
         - Constraint (QoS) handled externally by lambda update
         """
-        if prev_state is None:
+        if prev_state is None: 
             return 0.0
 
         prev_state = np.array(prev_state).flatten()
         current_state = np.array(current_state).flatten()
 
-        NETWORK_START_IDX = 17  # adjust if different
-        idx_total_energy = NETWORK_START_IDX + 0   # totalEnergy
-
-        prev_energy = prev_state[idx_total_energy]
-        curr_energy = current_state[idx_total_energy]
-
-        energy_delta = curr_energy - prev_energy
-        energy_scale = config.get('energy_grad_coeff', 1000.0)
-        reward = -energy_scale * energy_delta / max(1e-6, prev_energy)
-
+        NETWORK_START_IDX = 17
+        
+        total_traffic_demand = current_state[NETWORK_START_IDX + 4]
+        total_energy_delta = current_state[NETWORK_START_IDX + 0] - prev_state[NETWORK_START_IDX + 0]
+        energy_scale = config['energy_reward_scale']
+        reward = 0.0
+        if total_traffic_demand < 1e-6:
+            reward = -0.01 * np.clip(total_energy_delta, -100, 100)
+        else:
+            reward = -energy_scale * total_energy_delta / total_traffic_demand
 
         # Clip để tránh outlier
         reward = np.clip(reward, -1000.0, 1000.0)
 
         if env_id == 0 and np.random.random() < 0.02:
-            print(f"ΔEnergy={energy_delta:.4f}, Reward={reward:.4f}")
+            print(f"Energy Delta={total_energy_delta:.4f}, Total Traffic Demand={total_traffic_demand:.4f}, Reward={reward:.4f}")
 
         return float(reward)
-
 
 
     def calculate_cost(self, current_state, env_id=0):
@@ -513,6 +533,8 @@ class RLAgent:
 
         NETWORK_START_IDX = 17
         CELL_START_IDX = 17 + 14
+        n = int(self.n_cells)
+        cur = np.asarray(current_state).flatten()
 
         drop = current_state[NETWORK_START_IDX + 2]
         latency = current_state[NETWORK_START_IDX + 3]
@@ -521,10 +543,15 @@ class RLAgent:
         cpu_th = current_state[13]
         prb_th = current_state[14]
 
-        CPU_FEATURE_IDX = CELL_START_IDX
-        PRB_FEATURE_IDX = CELL_START_IDX + self.n_cells
-        max_cpu = np.max(current_state[CPU_FEATURE_IDX:CPU_FEATURE_IDX + self.n_cells])
-        max_prb = np.max(current_state[PRB_FEATURE_IDX:PRB_FEATURE_IDX + self.n_cells])
+        # --- per-cell extraction (column-stacked) ---
+        def read_block(offset):
+            if n == 0:
+                return np.zeros(0, dtype=np.float32)
+            start = CELL_START_IDX + offset * n
+            return np.asarray(cur[start:start + n], dtype=np.float32)
+
+        max_cpu = np.max(read_block(0))
+        max_prb = np.max(read_block(1))
 
         def _violation_penalty(x, th):
             violation_ratio = max(0.0, (x - th) / max(1e-6, th))
@@ -545,9 +572,10 @@ class RLAgent:
         qos_cost = np.clip(qos_cost, 0.0, 1000.0)
 
         if env_id == 0 and np.random.random() < 0.02:
-            print(f"qos_cost: {qos_cost:.4f}")
-            print(f"drop_vio={drop_violation:.4f}, lat_vio={latency_violation:.4f}, "
-                f"cpu_vio={cpu_violation:.4f}, prb_vio={prb_violation:.4f}")
+            print(f"Drop={drop:.4f}%, Latency={latency:.4f}ms, CPU={max_cpu:.4f}%, PRB={max_prb:.4f}%")
+            print(f"QoS Cost: {qos_cost:.4f}")
+            print(f"Drop Violation={drop_violation:.4f}, Latency Violation={latency_violation:.4f}, "
+                f"CPU Violation={cpu_violation:.4f}, PRB Violation={prb_violation:.4f}")
 
         return float(qos_cost)
 
@@ -583,13 +611,14 @@ class RLAgent:
         
         # Ensure proper shapes
         raw_state = np.array(state).flatten().copy()
-        state = self.normalize_state(raw_state)
-        state = self.pad_state(state)
-        state = self.augment_state(raw_state, state, self.prev_states.get(env_id))
+        augmented_state = self.augment_state(raw_state)
+        self.running_norm.update(augmented_state)
+        normalized_augmented_state = self.running_norm.normalize(augmented_state)
+        padded_augmented_state = self.pad_state(normalized_augmented_state)
         
         action = np.array(action).flatten()
         # Get value estimates
-        state_tensor = torch.FloatTensor(state).unsqueeze(0).to(self.device)
+        state_tensor = torch.FloatTensor(padded_augmented_state).unsqueeze(0).to(self.device)
         
         with torch.no_grad():
             value = self.critic(state_tensor).cpu().numpy().flatten()[0]
@@ -597,16 +626,17 @@ class RLAgent:
         # Create transition
         # Build transition with next_state retained (normalized/padded/augmented like state)
         raw_next_state = np.array(next_state).flatten().copy()
-        next_state_norm = self.normalize_state(raw_next_state)
-        next_state_pad = self.pad_state(next_state_norm)
-        next_state_aug = self.augment_state(raw_next_state, next_state_pad, raw_state)
+        next_augmented_state = self.augment_state(raw_next_state)
+        self.running_norm.update(next_augmented_state)
+        normalized_next_augmented_state = self.running_norm.normalize(next_augmented_state)
+        padded_next_augmented_state = self.pad_state(normalized_next_augmented_state)
 
         transition = Transition(
-            state=state,
+            state=padded_augmented_state,
             action=action,
             reward=actual_reward,
             cost=actual_cost,
-            next_state=next_state_aug,
+            next_state=padded_next_augmented_state,
             done=done,
             log_prob=self.last_log_probs.get(env_id, 0.0),
             value=value,
@@ -763,7 +793,6 @@ class RLAgent:
                 # Lagrangian objective (maximize reward, minimize cost)
                 lagrange = torch.clamp(torch.tensor(self.lambda_multiplier, device=self.device), 0.0, self.lambda_max)
                 actor_loss = -(L_reward - lagrange * L_cost) - self.entropy_coef * entropy
-
                 current_values = self.critic(batch_states).squeeze()
                 critic_loss = nn.MSELoss()(current_values, batch_returns.detach())
                 # Cost critic loss
@@ -815,8 +844,8 @@ class RLAgent:
         self.metrics['critic_loss'].append(final_critic_loss)
         self.metrics['cost_critic_loss'].append(final_cost_critic_loss)
         self.logger.info(
-            f"Train: J_r={J_r:.4f}, J_c={J_c:.4f}, lambda={self.lambda_multiplier:.4f}, "
-            f"actor={final_actor_loss:.4f}, critic={final_critic_loss:.4f}, cost_critic={final_cost_critic_loss:.4f}, ent={final_entropy:.4f}"
+            f"Train: J_r={J_r:.4f}, J_c={J_c:.4f}, Lambda={self.lambda_multiplier:.4f}, "
+            f"Actor Loss={final_actor_loss:.4f}, Critic Loss={final_critic_loss:.4f}, Cost Critic Loss={final_cost_critic_loss:.4f}, Entropy={final_entropy:.4f}"
         )
 
     
