@@ -111,10 +111,14 @@ class RLAgent:
         self.hidden_dim = config['hidden_dim']
         self.entropy_coef = config['entropy_coef']
         # Lagrangian PPO hyperparameters
-        self.lambda_lr = float(config.get('lambda_lr', 1e-3))
-        self.lambda_multiplier = float(config.get('lambda_init', 1.0))
-        self.lambda_max = float(config.get('lambda_max', 10.0))
-        self.cost_target = float(config.get('cost_target', 0.0))
+        self.lambda_lr = float(config['lambda_lr'])
+        self.lambda_multiplier = float(config['lambda_init'])
+        self.lambda_max = float(config['lambda_max'])
+        self.cost_target = float(config['cost_target'])
+        # Practical tolerance for constraint satisfaction and early stop control
+        self.cost_tolerance = float(config['cost_tolerance'])
+        self.cost_stop_patience = int(config['cost_stop_patience'])
+        self.cost_ok_streak = 0
                 
         # use augmented state dimension for actor and critic
         self.actor = Actor(self.state_dim, self.action_dim, self.hidden_dim).to(self.device)
@@ -821,7 +825,15 @@ class RLAgent:
             J_c = 0.0
         else:
             J_c = float(np.mean(env_cost_means))
-        self.lambda_multiplier = float(np.clip(self.lambda_multiplier + self.lambda_lr * (J_c - self.cost_target), 0.0, self.lambda_max))
+        # Dual ascent with slack: allow tolerance around the target
+        target_with_tol = self.cost_target + self.cost_tolerance
+        self.lambda_multiplier = float(np.clip(self.lambda_multiplier + self.lambda_lr * (J_c - target_with_tol), 0.0, self.lambda_max))
+        
+        # Tolerance-based stopping rule (consecutive updates under target+tol)
+        if J_c <= target_with_tol:
+            self.cost_ok_streak += 1
+        else:
+            self.cost_ok_streak = 0
         
         # Mean reward across buffer
         J_r = float(np.mean(rewards)) if len(rewards) > 0 else 0.0
@@ -834,7 +846,7 @@ class RLAgent:
         self.metrics['critic_loss'].append(final_critic_loss)
         self.metrics['cost_critic_loss'].append(final_cost_critic_loss)
         self.logger.info(
-            f"Train: J_r={J_r:.4f}, J_c={J_c:.4f}, Lambda={self.lambda_multiplier:.4f}, "
+            f"Train: J_r={J_r:.4f}, J_c={J_c:.4f}, Target+tol={target_with_tol:.4f}, Streak={self.cost_ok_streak}/{self.cost_stop_patience}, Lambda={self.lambda_multiplier:.4f}, "
             f"Actor Loss={final_actor_loss:.4f}, Critic Loss={final_critic_loss:.4f}, Cost Critic Loss={final_cost_critic_loss:.4f}, Entropy={final_entropy:.4f}"
         )
 
@@ -920,8 +932,9 @@ class RLAgent:
             axes[0,1].plot(self.metrics['cost'], alpha=0.4, label='Cost', color='red')
             if len(self.metrics['cost']) >= 5:
                 axes[0,1].plot(ma(self.metrics['cost']), label='Cost MA', linewidth=2, color='darkred')
-            # Draw target line
+            # Draw target and tolerance line
             axes[0,1].axhline(self.cost_target, color='gray', linestyle='--', linewidth=1, label='Cost Target')
+            axes[0,1].axhline(self.cost_target + getattr(self, 'cost_tolerance', 0.0), color='gray', linestyle=':', linewidth=1, label='Target + tol')
             axes[0,1].set_title('Mean Cost per Update')
             axes[0,1].grid(True, alpha=0.3)
             axes[0,1].legend(fontsize=8)

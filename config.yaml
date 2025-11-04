@@ -1,4 +1,4 @@
-training_mode: False
+training_mode: True
 use_gpu: False
 
 checkpoint_load_path: "models/um_run1.pth"
@@ -26,4 +26,8 @@ lambda_lr: 0.05
 lambda_max: 100.0
 # Target average cost per step (set per-scenario scale). 0 encourages constraint satisfaction.
 cost_target: 0.0
+# Practical tolerance and early stop
+cost_tolerance: 0.1
+cost_stop_patience: 10
+
 
