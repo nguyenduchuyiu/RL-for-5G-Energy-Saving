@@ -60,7 +60,7 @@ RUN wget --progress=bar:force https://ssd.mathworks.com/supportfiles/downloads/R
 # --- Copy Application Files ---
 WORKDIR /app
 COPY main_run_scenarios run_main_run_scenarios.sh /app/
-COPY test_scenarios/ /app/scenarios/
+COPY scenarios/ /app/scenarios/
 COPY energy_agent/ /app/energy_agent/
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh
 
