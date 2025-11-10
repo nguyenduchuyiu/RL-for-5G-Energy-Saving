@@ -514,7 +514,7 @@ class RLAgent:
         # Clip để tránh outlier
         reward = np.clip(reward, -100.0, 100.0)
 
-        if env_id == 0 and np.random.random() < 1:
+        if env_id == 0 and np.random.random() < 0.02:
             print(f"Energy={total_energy:.4f}, Total Traffic Demand={total_traffic_demand:.4f}, Reward={reward:.4f}")
 
         return float(reward)
