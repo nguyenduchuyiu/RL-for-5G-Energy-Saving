@@ -503,19 +503,19 @@ class RLAgent:
         NETWORK_START_IDX = 17
         
         total_traffic_demand = current_state[NETWORK_START_IDX + 4]
-        total_energy_delta = current_state[NETWORK_START_IDX + 0] - prev_state[NETWORK_START_IDX + 0]
+        total_energy = current_state[NETWORK_START_IDX + 0]
         energy_scale = config['energy_reward_scale']
         reward = 0.0
         if total_traffic_demand < 1e-6:
-            reward = -0.01 * np.clip(total_energy_delta, -100, 100)
+            reward = 0
         else:
-            reward = -energy_scale * total_energy_delta / total_traffic_demand
+            reward = -energy_scale * total_energy / total_traffic_demand
 
         # Clip để tránh outlier
         reward = np.clip(reward, -100.0, 100.0)
 
-        if env_id == 0 and np.random.random() < 0.02:
-            print(f"Energy Delta={total_energy_delta:.4f}, Total Traffic Demand={total_traffic_demand:.4f}, Reward={reward:.4f}")
+        if env_id == 0 and np.random.random() < 1:
+            print(f"Energy={total_energy:.4f}, Total Traffic Demand={total_traffic_demand:.4f}, Reward={reward:.4f}")
 
         return float(reward)
 

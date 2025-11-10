@@ -1,14 +1,14 @@
-training_mode: False
+training_mode: True
 use_gpu: False
 
-checkpoint_load_path: "models/um2.pth"
-checkpoint_save_path: "models/um_run5.pth"
+checkpoint_load_path: "models/0.pth"
+checkpoint_save_path: "models/1.pth"
 
 actor_lr: 0.0001
 critic_lr: 0.0003
 
-energy_reward_scale: 10.0
-cost_scale: 1.0
+energy_reward_scale: 0.005
+cost_scale: 2.0
 
 entropy_coef: 0.01
 gamma: 0.99
@@ -22,12 +22,12 @@ hidden_dim: 256
 
 # Lagrangian PPO settings
 lambda_init: 0.0
-lambda_lr: 0.05
-lambda_max: 100.0
+lambda_lr: 0.1
+lambda_max: 10.0
 # Target average cost per step (set per-scenario scale). 0 encourages constraint satisfaction.
 cost_target: 0.0
 # Practical tolerance and early stop
-cost_tolerance: 0.1
+cost_tolerance: 1.2
 cost_stop_patience: 10
 
 
