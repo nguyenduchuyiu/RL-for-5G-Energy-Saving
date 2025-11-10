@@ -1,7 +1,7 @@
 training_mode: False
 use_gpu: False
 
-checkpoint_load_path: "models/um_run1_big_brain.pth"
+checkpoint_load_path: "models/um2.pth"
 checkpoint_save_path: "models/um_run5.pth"
 
 actor_lr: 0.0001
