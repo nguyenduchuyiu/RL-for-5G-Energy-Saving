@@ -1,0 +1,41 @@
+{
+    "name": "Highway Scenario",
+    "description": "3GPP Highway deployment with high-speed vehicles",
+    "deploymentScenario": "highway",
+
+    "carrierFrequency": 6e9,
+    "systemBandwidth": 100e6,
+    "layout": "highway_linear",
+    "isd": 1732,
+
+    "numSites": 7,
+    "numSectors": 3,
+    "antennaHeight": 35,
+    "cellRadius": 866,
+
+    "highwayLength": 10000,
+    "numLanes": 3,
+    "laneWidth": 3.5,
+    "numUEs": 100,
+    "userDistribution": "100% in vehicles",
+    "ueSpeed": 100,
+
+    "minTxPower": 30,
+    "maxTxPower": 46,
+    "basePower": 1200,
+    "idlePower": 300,
+
+    "simTime": 500,
+    "timeStep": 1,
+
+    "rsrpServingThreshold": -110,
+    "rsrpTargetThreshold": -100,
+    "rsrpMeasurementThreshold": -115,
+    "dropCallThreshold": 1,
+    "latencyThreshold": 50,
+    "cpuThreshold": 95,
+    "prbThreshold": 95,
+
+    "trafficLambda": 50,
+    "peakHourMultiplier": 1.2
+}

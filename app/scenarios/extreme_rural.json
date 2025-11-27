@@ -1,0 +1,39 @@
+{
+  "name": "Extreme Rural",
+  "description": "3GPP Extreme long distance coverage in low density areas",
+  "deploymentScenario": "extreme_rural",
+  
+  "carrierFrequency": 700e6,
+  "systemBandwidth": 20e6,
+  "layout": "single_layer_isolated",
+  "isd": 2000,
+  
+  "numSites": 7,
+  "numSectors": 3,
+  "antennaHeight": 45,
+  "cellRadius": 50000,
+  
+  "numUEs": 50,
+  "userDistribution": "Sparse",
+  "ueSpeed": 160,
+  "indoorRatio": 0.1,
+  
+  "minTxPower": 13,
+  "maxTxPower": 46,
+  "basePower": 1500,
+  "idlePower": 400,
+  
+  "simTime": 500,
+  "timeStep": 1,
+  
+  "rsrpServingThreshold": -120,
+  "rsrpTargetThreshold": -110,
+  "rsrpMeasurementThreshold": -125,
+  "dropCallThreshold": 2,
+  "latencyThreshold": 100,
+  "cpuThreshold": 95,
+  "prbThreshold": 95,
+  
+  "trafficLambda": 5,
+  "peakHourMultiplier": 1.2
+}
